@@ -37,17 +37,29 @@ impl Harness {
     /// and only then start `ds sync` — for tests whose assertions depend on
     /// state existing before the very first sync (e.g. `.gitignore` rules).
     pub fn with_setup(setup: impl FnOnce(&Path, &Path)) -> Harness {
-        Self::build(setup, false)
+        Self::build(setup, false, None)
     }
 
     /// A harness whose `ds sync` child sees a broken `rsync` (a stub that
     /// always fails), so no sync can ever complete — for testing timeout
     /// behavior.
     pub fn with_broken_rsync() -> Harness {
-        Self::build(|_repo, _dest| {}, true)
+        Self::build(|_repo, _dest| {}, true, None)
     }
 
-    fn build(setup: impl FnOnce(&Path, &Path), break_rsync: bool) -> Harness {
+    /// A harness that syncs over ssh: the target is `HOST:DEST` where DEST
+    /// is still the harness's local temp directory, so assertions on the
+    /// destination keep working when HOST is the local machine (e.g.
+    /// `localhost`). Requires non-interactive ssh to HOST.
+    pub fn with_ssh_host(host: &str) -> Harness {
+        Self::build(|_repo, _dest| {}, false, Some(host.to_string()))
+    }
+
+    fn build(
+        setup: impl FnOnce(&Path, &Path),
+        break_rsync: bool,
+        ssh_host: Option<String>,
+    ) -> Harness {
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tmp.path().join("repo");
         let dest = tmp.path().join("dest");
@@ -58,9 +70,13 @@ impl Harness {
 
         let stderr_path = tmp.path().join("ds-sync.stderr");
         let stderr = std::fs::File::create(&stderr_path).unwrap();
+        let target: std::ffi::OsString = match &ssh_host {
+            Some(host) => format!("{host}:{}", dest.display()).into(),
+            None => dest.clone().into_os_string(),
+        };
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ds"));
         cmd.args(["sync"])
-            .arg(&dest)
+            .arg(&target)
             .current_dir(&repo)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
