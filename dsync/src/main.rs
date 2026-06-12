@@ -1,9 +1,9 @@
-use anyhow::bail;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 mod barrier;
 mod client;
+mod exec;
 mod protocol;
 mod repo;
 mod server;
@@ -49,21 +49,14 @@ enum Command {
         /// Skip the barrier; run immediately.
         #[arg(long)]
         no_wait: bool,
+        /// Give up (and exit with code 3) if the replica is not up-to-date
+        /// within this many seconds; the command is not run.
+        #[arg(long, conflicts_with = "no_wait")]
+        timeout: Option<f64>,
         /// The command (and arguments) to run.
         #[arg(required = true, trailing_var_arg = true)]
         command: Vec<String>,
     },
-}
-
-impl Command {
-    fn name(&self) -> &'static str {
-        match self {
-            Command::Sync { .. } => "sync",
-            Command::Status => "status",
-            Command::Barrier { .. } => "barrier",
-            Command::Exec { .. } => "exec",
-        }
-    }
 }
 
 async fn cmd_sync(target: &str) -> anyhow::Result<()> {
@@ -93,7 +86,11 @@ async fn main() -> anyhow::Result<()> {
             barrier::Outcome::Synced => Ok(()),
             barrier::Outcome::TimedOut => std::process::exit(barrier::TIMEOUT_EXIT_CODE),
         },
-        _ => bail!("`ds {}` is not implemented yet", cli.command.name()),
+        Command::Exec {
+            no_wait,
+            timeout,
+            command,
+        } => exec::cmd_exec(*no_wait, *timeout, command).await,
     }
 }
 

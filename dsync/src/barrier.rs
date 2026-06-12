@@ -27,12 +27,18 @@ pub enum Outcome {
     TimedOut,
 }
 
-pub async fn cmd_barrier(timeout: Option<f64>) -> Result<Outcome> {
+/// Validate a `--timeout` value (shared with `ds exec`).
+pub fn validate_timeout(timeout: Option<f64>) -> Result<()> {
     if let Some(t) = timeout
         && !(t.is_finite() && t >= 0.0)
     {
         bail!("--timeout must be a non-negative number of seconds");
     }
+    Ok(())
+}
+
+pub async fn cmd_barrier(timeout: Option<f64>) -> Result<Outcome> {
+    validate_timeout(timeout)?;
     let repo_root = repo::find_repo_root(&std::env::current_dir()?)?;
     let mut client = IpcClient::connect(&repo_root).await?;
     let response: BarrierResponse = client
@@ -46,13 +52,15 @@ pub async fn cmd_barrier(timeout: Option<f64>) -> Result<Outcome> {
     }
     // The server replies with not-covered state only when the (requested)
     // timeout expired.
+    // Phrased for both callers (`ds barrier` itself and `ds exec`'s
+    // implicit barrier).
     match &response.synced {
         Some(synced) => eprintln!(
-            "ds barrier timed out: last completed sync covers seq {}, but this barrier needs seq {}",
+            "timed out waiting for sync: last completed sync covers seq {}, but this barrier needs seq {}",
             synced.seq, response.target_seq
         ),
         None => eprintln!(
-            "ds barrier timed out: no sync has completed yet (this barrier needs seq {})",
+            "timed out waiting for sync: no sync has completed yet (this barrier needs seq {})",
             response.target_seq
         ),
     }

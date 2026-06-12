@@ -1,6 +1,6 @@
 //! Integration tests for the `ds` CLI surface: every subcommand exists
-//! (including its aliases), unimplemented ones fail loudly, and bad `sync`
-//! invocations fail fast. End-to-end sync behavior is covered in `sync.rs`.
+//! (including its aliases), and bad invocations fail fast. End-to-end
+//! behavior is covered in `sync.rs`/`status.rs`/`barrier.rs`/`exec.rs`.
 
 use std::process::{Command, Output};
 
@@ -9,21 +9,6 @@ fn ds(args: &[&str]) -> Output {
         .args(args)
         .output()
         .expect("failed to run ds")
-}
-
-fn assert_not_implemented(args: &[&str], canonical: &str) {
-    let out = ds(args);
-    assert!(
-        !out.status.success(),
-        "`ds {}` should exit non-zero",
-        args.join(" ")
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains(&format!("`ds {canonical}` is not implemented yet")),
-        "`ds {}` stderr should report `ds {canonical}` unimplemented; got: {stderr}",
-        args.join(" ")
-    );
 }
 
 #[test]
@@ -124,10 +109,26 @@ fn barrier_rejects_a_negative_timeout() {
 }
 
 #[test]
-fn exec_is_stubbed_with_alias() {
-    assert_not_implemented(&["exec", "true"], "exec");
-    assert_not_implemented(&["x", "true"], "exec");
-    assert_not_implemented(&["exec", "--no-wait", "make", "-j4"], "exec");
+fn exec_outside_a_repo_fails_fast() {
+    let tmp = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["exec", "true"],
+        vec!["x", "true"],
+        vec!["exec", "--no-wait", "make", "-j4"],
+        vec!["exec", "--timeout", "1.5", "true"],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_ds"))
+            .args(&args)
+            .current_dir(tmp.path())
+            .output()
+            .expect("failed to run ds");
+        assert!(!out.status.success(), "exec outside a repo should fail");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("not inside a git repository"),
+            "stderr should explain the git requirement; got: {stderr}"
+        );
+    }
 }
 
 #[test]
@@ -136,5 +137,35 @@ fn exec_requires_a_command() {
     assert!(
         !out.status.success(),
         "`ds exec` without a command should fail"
+    );
+}
+
+#[test]
+fn exec_rejects_timeout_with_no_wait() {
+    let out = ds(&["exec", "--no-wait", "--timeout", "1", "true"]);
+    assert!(
+        !out.status.success(),
+        "`--timeout` with `--no-wait` should be a usage error"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "conflicting flags are a clap usage error"
+    );
+}
+
+#[test]
+fn exec_rejects_a_negative_timeout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_ds"))
+        .args(["exec", "--timeout=-1", "true"])
+        .current_dir(tmp.path())
+        .output()
+        .expect("failed to run ds");
+    assert!(!out.status.success(), "negative timeout should be rejected");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("non-negative"),
+        "stderr should explain the timeout requirement; got: {stderr}"
     );
 }
