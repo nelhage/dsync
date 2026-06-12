@@ -6,8 +6,8 @@ earlier ones. Design decisions made along the way are recorded at the end.
 
 ## Notes for implementation sessions
 
-Status as of 2026-06-12: Phases 0–3 complete; Phases 4+ not started. Next
-up: Phase 4 (and Phase 5 may proceed in parallel — the `dsync-ignore` stub
+Status as of 2026-06-12: Phases 0–4 complete; Phases 5+ not started (a
+Phase 5 agent may already be running in parallel — the `dsync-ignore` stub
 crate exists).
 
 - [dsync.md](dsync.md) is the authoritative behavior spec; this file covers
@@ -227,6 +227,27 @@ exit code, and the wire protocol. Notes for later phases:
 - `--timeout` flag; on expiry exit non-zero with a distinct exit code.
 
 ## Phase 4 — `ds exec`
+
+**Status: done (2026-06-12).** `ds exec` (`exec.rs`) works as specced
+below, plus a `--timeout` flag (mutually exclusive with `--no-wait`) that
+exits 3 on expiry like `ds barrier`. Notes for later phases:
+
+- Target discovery is a plain `status` request: the `target` string in
+  `StatusResponse` round-trips through `Target::parse` (local targets are
+  stored absolute, so scp-style parsing is unambiguous). Phase 8's named
+  replicas just need to thread a replica name through `cmd_exec`.
+- The command is `exec(2)`'d in place (never spawned), so exit status and
+  signal disposition propagate inherently; exec failure exits 127/126 like
+  a shell. Remote form: `ssh [-t] HOST 'cd PATH && exec WORDS...'` with
+  each word quoted by `exec::sh_quote` (`-t` iff our stdin is a TTY) —
+  reuse `sh_quote` for Phase 6's remote unpacker invocation.
+- `--timeout` validation is shared via `barrier::validate_timeout`, and the
+  barrier-timeout message is phrased for both callers.
+- ssh-path integration tests are gated: set `DSYNC_TEST_SSH=localhost` (or
+  any non-interactive-auth host that shares this filesystem) to run
+  `tests/exec.rs: exec_over_ssh` via `Harness::with_ssh_host`; CI without
+  ssh skips it. Everything else is covered with local-path targets, plus a
+  unit test that round-trips quoted argv through a real `sh`.
 
 - Discover the running sync session (via the `.dsync` socket) to learn
   HOST:PATH; error clearly if no sync is running.
