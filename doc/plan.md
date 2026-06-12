@@ -6,7 +6,9 @@ earlier ones. Design decisions made along the way are recorded at the end.
 
 ## Notes for implementation sessions
 
-Status as of 2026-06-12: docs only; no code exists yet. Start at Phase 0.
+Status as of 2026-06-12: Phase 0 complete; Phases 1+ not started. Next up:
+Phase 1 (and Phase 5 may proceed in parallel — the `dsync-ignore` stub crate
+exists).
 
 - [dsync.md](dsync.md) is the authoritative behavior spec; this file covers
   sequencing and recorded decisions. The Decisions section at the bottom was
@@ -20,6 +22,17 @@ Status as of 2026-06-12: docs only; no code exists yet. Start at Phase 0.
   `dsync-ignore` (Phase 5).
 
 ## Phase 0 — Project scaffolding
+
+**Status: done (2026-06-12).** Workspace with `dsync` (binary `ds`) and a
+stub `dsync-ignore` lib crate; clap CLI with `sync`/`status`/`barrier`/`exec`
+subcommands (aliases `stat`+`s`/`b`/`x`) that exit non-zero with "not
+implemented"; tracing logging to stderr (`RUST_LOG`, default `info`);
+integration tests in `dsync/tests/cli.rs` drive the real binary via
+`CARGO_BIN_EXE_ds`. CI (`.github/workflows/ci.yml`) runs build/test/clippy/fmt
+inside the repo's nix dev shell, which provides watchman and rsync for
+integration tests. Notes for later phases: subcommand args are minimal stubs
+(sync TARGET, barrier `--timeout`, exec `--no-wait` + trailing argv) — extend
+as phases land, and update `dsync/tests/cli.rs` when stubs become real.
 
 - Cargo project: binary named `ds`, crate named `dsync`.
 - Dependencies: `tokio` (async runtime), `clap` (CLI, with subcommand aliases
