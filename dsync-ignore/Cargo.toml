@@ -6,3 +6,10 @@ license.workspace = true
 description = "Ignore-rule parsing and translation for dsync (gitignore semantics -> rsync filters / watchman queries)"
 
 [dependencies]
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+proptest = "1.5"
+tempfile = "3.10"
