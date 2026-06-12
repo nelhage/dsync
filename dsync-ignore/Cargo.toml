@@ -1,0 +1,8 @@
+[package]
+name = "dsync-ignore"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ignore-rule parsing and translation for dsync (gitignore semantics -> rsync filters / watchman queries)"
+
+[dependencies]
