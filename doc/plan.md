@@ -6,8 +6,8 @@ earlier ones. Design decisions made along the way are recorded at the end.
 
 ## Notes for implementation sessions
 
-Status as of 2026-06-12: Phases 0–1 complete; Phases 2+ not started. Next
-up: Phase 2 (and Phase 5 may proceed in parallel — the `dsync-ignore` stub
+Status as of 2026-06-12: Phases 0–2 complete; Phases 3+ not started. Next
+up: Phase 3 (and Phase 5 may proceed in parallel — the `dsync-ignore` stub
 crate exists).
 
 - [dsync.md](dsync.md) is the authoritative behavior spec; this file covers
@@ -109,6 +109,33 @@ Deliverable: usable tool for the basic workflow. Integration tests use
 local-path targets with temp git repos.
 
 ## Phase 2 — IPC server and `ds status`
+
+**Status: done (2026-06-12).** `.dsync/` + flock liveness (`server.rs:
+ControlDir`), the single-socket JSON protocol (`protocol.rs` wire types,
+`server.rs` dispatch, `client.rs` `IpcClient`), shared state (`state.rs:
+ServerState`, updated by the sync runner), and `ds status` (`status.rs`)
+all work as specced below. Notes for later phases:
+
+- Clock invariants are enforced structurally: clocks live only in
+  `state::SyncedClock` inside the server; the wire types in `protocol.rs`
+  carry only seqs and unix-seconds times (an integration test pins that no
+  "clock" key ever appears on the wire). Receipt-order seqs come from the
+  central `ServerState::next_seq()` counter — Phase 3's barrier should
+  assign its cookie-synchronized clock reads from the same counter.
+- Phase 3 hooks: add a `RequestOp` variant (tagged enum, easy to extend);
+  the runner records `SyncedClock` into `ServerState` after each completed
+  sync — barrier wake-ups will want a notification there (e.g. a
+  `tokio::sync::watch` of the last-synced seq) rather than polling.
+- The status since-query excludes only `.git`/`.dsync`
+  (`server.rs: exclude_internal_paths`); gitignored churn therefore counts
+  as "pending" until the next (no-op) sync covers it. Phase 5's
+  watchman-query translation should replace that expression.
+- Error responses are in-band (`{"version":1,"error":"..."}`); a
+  connection survives bad requests. Responses built via `serde_json::Value`
+  serialize with sorted keys — don't assert on key order in tests.
+- The test harness moved to `dsync/tests/common/mod.rs` (shared by
+  `sync.rs`/`status.rs`), and grew `ds()`/`wait_for_socket()` helpers.
+  It still waits by polling; switch it to `ds barrier` in Phase 3.
 
 - `ds sync` creates `.dsync/` at the repo root and listens on a single UNIX
   socket, `.dsync/dsync.sock`. Replica multiplexing is in-band: requests carry
