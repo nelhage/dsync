@@ -6,8 +6,8 @@ earlier ones. Design decisions made along the way are recorded at the end.
 
 ## Notes for implementation sessions
 
-Status as of 2026-06-12: Phases 0–2 complete; Phases 3+ not started. Next
-up: Phase 3 (and Phase 5 may proceed in parallel — the `dsync-ignore` stub
+Status as of 2026-06-12: Phases 0–3 complete; Phases 4+ not started. Next
+up: Phase 4 (and Phase 5 may proceed in parallel — the `dsync-ignore` stub
 crate exists).
 
 - [dsync.md](dsync.md) is the authoritative behavior spec; this file covers
@@ -179,6 +179,43 @@ never parse or compare clock strings:
   new-epoch.
 
 ## Phase 3 — `ds barrier`
+
+**Status: done (2026-06-12).** `ds barrier` (`barrier.rs` client,
+`server.rs: handle_barrier`/`wait_for_coverage`) works as specced below;
+the integration-test harness (`tests/common/mod.rs`) now waits via real
+`ds barrier` runs, and `tests/barrier.rs` covers semantics, the timeout
+exit code, and the wire protocol. Notes for later phases:
+
+- The barrier's clock value is read (cookie-synchronized) and immediately
+  discarded: only its receipt-order seq matters. Seqs for IPC-read clocks
+  are granted by the watchman reader task (`server.rs: SeqAssigner`),
+  whose `biased` select drains already-delivered subscription
+  notifications before granting — that keeps seq order equal to clock
+  receipt order even though notifications and command responses are
+  delivered to different tasks. Phase 6's fast path must keep all seq
+  assignment on these two paths (reader receipt + granted-after-read).
+- Release needs *two* conditions, checked on each sync completion
+  (`state.rs: record_synced` bumps a `tokio::sync::watch` generation that
+  `subscribe_synced` waiters re-check): `synced.seq >= target_seq`
+  (starvation-proof under churn), plus an empty cookie-synchronized
+  since-query against the synced clock — without the latter, a barrier
+  whose clock was bumped by non-file activity (e.g. its own sync cookie)
+  parks forever in a quiet repo, since no notification (hence no sync)
+  is coming.
+- Timeouts ride in the request (`timeout` seconds, f64); on expiry the
+  server replies with the current not-covered state ("state not flags")
+  and the client judges via `BarrierResponse::is_covered`, exiting with
+  the distinct code 3 (`barrier::TIMEOUT_EXIT_CODE`; 1 = generic error,
+  2 = clap usage error). Phase 4's `ds exec` should reuse
+  `cmd_barrier`/`Outcome` (and propagate exit 3 on `--timeout`, if exec
+  grows one).
+- Parked barriers hold their IPC connection; requests on one connection
+  are served serially, so a client must not pipeline another request
+  behind a barrier on the same connection (one-shot CLI clients don't).
+- Harness note: `Harness::barrier()` retries "no ds sync is running"
+  within the deadline (startup/stale-socket rebind race);
+  `Harness::with_broken_rsync()` shadows rsync with a failing stub to
+  force never-synced states for timeout tests.
 
 - Client sends a bare `barrier` request (replica name, optional timeout).
 - Server reads the current watchman clock with `sync_timeout` (cookie
