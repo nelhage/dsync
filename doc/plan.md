@@ -6,9 +6,9 @@ earlier ones. Design decisions made along the way are recorded at the end.
 
 ## Notes for implementation sessions
 
-Status as of 2026-06-12: Phase 0 complete; Phases 1+ not started. Next up:
-Phase 1 (and Phase 5 may proceed in parallel — the `dsync-ignore` stub crate
-exists).
+Status as of 2026-06-12: Phases 0–1 complete; Phases 2+ not started. Next
+up: Phase 2 (and Phase 5 may proceed in parallel — the `dsync-ignore` stub
+crate exists).
 
 - [dsync.md](dsync.md) is the authoritative behavior spec; this file covers
   sequencing and recorded decisions. The Decisions section at the bottom was
@@ -43,6 +43,43 @@ as phases land, and update `dsync/tests/cli.rs` when stubs become real.
   tests.
 
 ## Phase 1 — Core sync loop (MVP)
+
+**Status: done (2026-06-12).** `ds sync [HOST:]PATH` works end-to-end:
+repo-root discovery (`repo.rs`), scp-style target parsing (`target.rs`), and
+the watchman-driven sync loop (`sync.rs`). Integration tests
+(`dsync/tests/sync.rs`) drive the real binary against temp git repos with
+local-path targets. Notes for later phases:
+
+- The rsync invocation is `rsync -a --delete-after --modify-window=-1` plus
+  filter rules. Two non-obvious flags, both load-bearing:
+  - `--delete-after`, not plain `--delete`: per-directory merge rules
+    (`:- .gitignore`) only protect receiver-side files from deletion if the
+    receiver has the merge files at deletion time, which delete-during does
+    not guarantee on the first sync (see "PER-DIRECTORY RULES AND DELETE" in
+    rsync(1)). Without it, a remote-only `target/artifact` is deleted by the
+    first sync even though `target/` is gitignored. Still never
+    `--delete-excluded`.
+  - `--modify-window=-1` enables nanosecond mtime comparison in rsync's
+    quick-check. Without it, a file rewritten with same-size contents within
+    the same second as the synced copy is skipped *forever* (size and
+    integer mtime never change again). Requires receiver rsync >= 3.1.3
+    (2018); if very old remote rsyncs ever matter, probe and degrade.
+- Settle window is 75ms; "at most one pending sync" falls out of a
+  `tokio::sync::watch` latest-value channel between the watchman reader task
+  and the sync runner. Failed syncs retry every 2s against the latest
+  pending event.
+- The subscription is unfiltered, so `.git/` (and gitignored-path) churn
+  triggers no-op rsyncs; harmless but noisy. Once Phase 5 lands, the
+  watchman-query translation can filter the subscription expression.
+- `sync.rs` keeps the in-memory `SyncedClock { seq, clock, completed_at }`
+  record (receipt-order seq per the clock-handling design); Phase 2 moves
+  this into state shared with the IPC server.
+- `ds sync` refuses a local target at/under the repo root (it would loop:
+  every sync triggers watchman again and recursively copies the replica).
+- Integration tests poll the destination with a deadline since `ds barrier`
+  doesn't exist yet; switch the harness to barriers in Phase 3. Tests
+  isolate the child from the developer's git config via
+  `GIT_CONFIG_GLOBAL=/dev/null` (etc.) — keep doing that.
 
 The goal: `ds sync [HOST:]PATH` works end-to-end with full-tree rsync on every
 change. No IPC, no fast path.
