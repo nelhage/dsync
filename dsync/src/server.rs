@@ -8,19 +8,21 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 use watchman_client::prelude::*;
 
 use crate::protocol::{
-    self, ListResponse, PendingStatus, Request, RequestOp, Response, RpcResult, StatusResponse,
-    SyncedStatus, SyncingStatus,
+    self, BarrierResponse, ListResponse, PendingStatus, Request, RequestOp, Response, RpcResult,
+    StatusResponse, SyncedStatus, SyncingStatus,
 };
-use crate::state::ServerState;
+use crate::state::{ReplicaState, ServerState};
 
 /// The shared watchman connection: the sync loop's subscription and the IPC
 /// server's queries all flow over this single connection, which is what
@@ -28,6 +30,50 @@ use crate::state::ServerState;
 pub struct Watchman {
     pub client: Client,
     pub root: ResolvedRoot,
+}
+
+/// A handle for assigning receipt-order sequence numbers to clocks the IPC
+/// server reads (e.g. for `barrier`).
+///
+/// Receipt order is clock order only if sequence numbers are assigned in
+/// the order clocks arrive over the watchman connection — but subscription
+/// notifications and command responses are delivered to *different* tasks,
+/// so assigning a sequence number directly here could race with a
+/// notification that was received earlier but not yet sequenced. Instead,
+/// every assignment is delegated to the watchman reader task, which drains
+/// all already-delivered subscription notifications (sequencing them) before
+/// granting a number. Since the watchman client dispatches everything it
+/// reads from the single connection serially, any notification the daemon
+/// sent before our clock response has already been delivered by the time we
+/// ask, and therefore gets the smaller sequence number.
+#[derive(Clone)]
+pub struct SeqAssigner {
+    tx: mpsc::UnboundedSender<oneshot::Sender<u64>>,
+}
+
+/// The reader-task end of [`seq_assigner`]: a queue of pending grant
+/// requests, each answered with a freshly assigned sequence number.
+pub type SeqRequests = mpsc::UnboundedReceiver<oneshot::Sender<u64>>;
+
+/// Create the channel pair connecting [`SeqAssigner::assign`] callers to
+/// the watchman reader task.
+pub fn seq_assigner() -> (SeqAssigner, SeqRequests) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    (SeqAssigner { tx }, rx)
+}
+
+impl SeqAssigner {
+    /// Assign the next receipt-order sequence number, ordered after every
+    /// clock already received over the watchman connection. Call this only
+    /// *after* the clock it sequences has been read (i.e. its response has
+    /// arrived).
+    pub async fn assign(&self) -> Result<u64> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(reply_tx)
+            .map_err(|_| anyhow::anyhow!("the watchman reader task is gone"))?;
+        reply_rx.await.context("the watchman reader task is gone")
+    }
 }
 
 /// The path of the IPC socket for a repo.
@@ -94,6 +140,7 @@ pub async fn run(
     listener: UnixListener,
     state: Arc<ServerState>,
     watchman: Arc<Watchman>,
+    seq: SeqAssigner,
 ) -> Result<()> {
     loop {
         let (stream, _addr) = listener
@@ -102,8 +149,9 @@ pub async fn run(
             .context("accept on the IPC socket failed")?;
         let state = Arc::clone(&state);
         let watchman = Arc::clone(&watchman);
+        let seq = seq.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(stream, state, watchman).await {
+            if let Err(err) = handle_connection(stream, state, watchman, seq).await {
                 debug!("IPC connection ended with error: {err:#}");
             }
         });
@@ -116,6 +164,7 @@ async fn handle_connection(
     stream: UnixStream,
     state: Arc<ServerState>,
     watchman: Arc<Watchman>,
+    seq: SeqAssigner,
 ) -> Result<()> {
     let (read_half, write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
@@ -125,7 +174,7 @@ async fn handle_connection(
             continue;
         }
         let result = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => handle_request(req, &state, &watchman).await,
+            Ok(req) => handle_request(req, &state, &watchman, &seq).await,
             Err(err) => RpcResult::Error(format!("cannot parse request: {err}")),
         };
         if let RpcResult::Error(err) = &result {
@@ -147,6 +196,7 @@ async fn handle_request(
     req: Request,
     state: &ServerState,
     watchman: &Watchman,
+    seq: &SeqAssigner,
 ) -> RpcResult<Value> {
     if req.version != protocol::VERSION {
         return RpcResult::Error(format!(
@@ -161,6 +211,9 @@ async fn handle_request(
             replicas: state.replica_names(),
         })),
         RequestOp::Status { replica } => handle_status(&replica, state, watchman).await,
+        RequestOp::Barrier { replica, timeout } => {
+            handle_barrier(&replica, timeout, state, watchman, seq).await
+        }
     }
 }
 
@@ -203,6 +256,120 @@ async fn handle_status(
         }),
         pending,
     }))
+}
+
+/// Handle a `barrier` request: pin down "now" and park until a completed
+/// sync covers it.
+///
+/// The pin is a cookie-synchronized watchman clock read performed *after*
+/// the request arrives ("as-of invocation" semantics): every filesystem
+/// change that happened before the request is covered by that clock. The
+/// clock value itself is discarded — only the receipt-order sequence
+/// number assigned to it (via the reader task, see [`SeqAssigner`])
+/// matters.
+async fn handle_barrier(
+    replica: &str,
+    timeout: Option<f64>,
+    state: &ServerState,
+    watchman: &Watchman,
+    seq: &SeqAssigner,
+) -> RpcResult<Value> {
+    if state.replica(replica).is_none() {
+        return RpcResult::Error(format!("unknown replica {replica:?}"));
+    }
+    if let Some(t) = timeout
+        && !(t.is_finite() && t >= 0.0)
+    {
+        return RpcResult::Error(format!(
+            "invalid barrier timeout {t}: must be a non-negative number of seconds"
+        ));
+    }
+    if let Err(err) = watchman
+        .client
+        .clock(&watchman.root, SyncTimeout::Default)
+        .await
+    {
+        return RpcResult::Error(format!(
+            "watchman clock read for replica {replica:?} failed: {err:#}"
+        ));
+    }
+    let target_seq = match seq.assign().await {
+        Ok(seq) => seq,
+        Err(err) => return RpcResult::Error(format!("{err:#}")),
+    };
+    debug!(replica, target_seq, "barrier parked");
+
+    let wait = wait_for_coverage(replica, target_seq, state, watchman);
+    let outcome = match timeout {
+        Some(t) => match tokio::time::timeout(Duration::from_secs_f64(t), wait).await {
+            Ok(outcome) => outcome,
+            // Timeout expired: reply with the current (not covered) state
+            // and let the client judge it.
+            Err(_elapsed) => state
+                .replica(replica)
+                .context("replica disappeared")
+                .map(|snapshot| (snapshot, None)),
+        },
+        None => wait.await,
+    };
+    let (snapshot, pending) = match outcome {
+        Ok(result) => result,
+        Err(err) => {
+            return RpcResult::Error(format!("barrier for replica {replica:?} failed: {err:#}"));
+        }
+    };
+    RpcResult::Ok(to_value(BarrierResponse {
+        replica: replica.to_string(),
+        target_seq,
+        synced: snapshot.synced.map(|s| SyncedStatus {
+            seq: s.seq,
+            completed_at: protocol::unix_seconds(s.completed_at),
+        }),
+        pending,
+    }))
+}
+
+/// Park until the replica's sync state covers `target_seq`, re-checking on
+/// every completed sync. Two ways to be covered:
+///
+/// - a completed sync's clock is sequenced at/after the barrier's
+///   (`synced.seq >= target_seq`) — under continuous churn this is the
+///   path that terminates, since the target is fixed while sync seqs only
+///   grow; or
+/// - a cookie-synchronized since-query against the synced clock comes back
+///   empty: nothing has changed since the last completed sync, so the
+///   replica is up-to-date as of *now* (>= the barrier's point in time).
+///   This is the path that terminates when the barrier's clock was bumped
+///   by non-file activity (e.g. its own sync cookie) and no further
+///   notification — hence no further sync — is ever coming.
+async fn wait_for_coverage(
+    replica: &str,
+    target_seq: u64,
+    state: &ServerState,
+    watchman: &Watchman,
+) -> Result<(ReplicaState, Option<PendingStatus>)> {
+    let mut completions = state.subscribe_synced();
+    loop {
+        // Mark the current generation seen *before* checking, so a sync
+        // completing during the checks below re-wakes us immediately.
+        completions.borrow_and_update();
+        let snapshot = state.replica(replica).context("replica disappeared")?;
+        if let Some(synced) = &snapshot.synced {
+            if synced.seq >= target_seq {
+                return Ok((snapshot, None));
+            }
+            let pending = pending_files(watchman, synced.clock.clone())
+                .await
+                .context("watchman since-query failed")?;
+            if pending.files == 0 {
+                return Ok((snapshot, Some(pending)));
+            }
+        }
+        completions
+            .changed()
+            .await
+            .context("the sync runner is gone")?;
+    }
 }
 
 /// Count the files changed since `clock` with a cookie-synchronized

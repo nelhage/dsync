@@ -47,6 +47,18 @@ pub enum RequestOp {
         #[serde(default = "default_replica")]
         replica: String,
     },
+    /// Block until a completed sync covers everything that changed before
+    /// this request arrived. The request is bare: the server reads the
+    /// watchman clock (cookie-synchronized) on the client's behalf, so the
+    /// "as-of" point is the moment the server receives the request.
+    Barrier {
+        #[serde(default = "default_replica")]
+        replica: String,
+        /// Give up after this many seconds: the server replies with the
+        /// (not yet covered) state at expiry instead of parking forever.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout: Option<f64>,
+    },
 }
 
 fn default_replica() -> String {
@@ -127,6 +139,40 @@ pub struct PendingStatus {
     pub fresh_instance: bool,
 }
 
+/// Payload of a `barrier` response. Per the "state not flags" principle,
+/// the server never says "done" or "timed out": it reports the sequence
+/// number it assigned to the request's clock and the sync state at reply
+/// time, and the client judges coverage with [`BarrierResponse::is_covered`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BarrierResponse {
+    pub replica: String,
+    /// Receipt-order sequence number assigned to the cookie-synchronized
+    /// clock the server read when the request arrived: the point in time
+    /// the barrier asks to be covered.
+    pub target_seq: u64,
+    /// The last completed sync at reply time.
+    pub synced: Option<SyncedStatus>,
+    /// Result of the server's since-query against the synced clock, when
+    /// one ran at reply time: `files == 0` means nothing has changed since
+    /// the last completed sync, i.e. the replica is up-to-date as of a
+    /// moment no earlier than the barrier itself.
+    pub pending: Option<PendingStatus>,
+}
+
+impl BarrierResponse {
+    /// Does this reply say the barrier's point in time is covered by a
+    /// completed sync? Either a sync covers a clock sequenced at/after the
+    /// barrier's, or nothing at all changed since the last completed sync.
+    pub fn is_covered(&self) -> bool {
+        if let Some(synced) = &self.synced
+            && synced.seq >= self.target_seq
+        {
+            return true;
+        }
+        matches!(&self.pending, Some(p) if p.files == 0)
+    }
+}
+
 /// Render a `SystemTime` as unix seconds for the wire.
 pub fn unix_seconds(t: SystemTime) -> f64 {
     match t.duration_since(SystemTime::UNIX_EPOCH) {
@@ -154,6 +200,84 @@ mod tests {
             serde_json::to_string(&req).unwrap(),
             r#"{"version":1,"request":"status","replica":"default"}"#
         );
+    }
+
+    #[test]
+    fn barrier_request_wire_format() {
+        // A bare barrier request: no timeout key, replica defaulted.
+        let req: Request = serde_json::from_str(r#"{"version":1,"request":"barrier"}"#).unwrap();
+        assert_eq!(
+            req.op,
+            RequestOp::Barrier {
+                replica: "default".into(),
+                timeout: None,
+            }
+        );
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r#"{"version":1,"request":"barrier","replica":"default"}"#
+        );
+
+        let req = Request::new(RequestOp::Barrier {
+            replica: "default".into(),
+            timeout: Some(1.5),
+        });
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r#"{"version":1,"request":"barrier","replica":"default","timeout":1.5}"#
+        );
+    }
+
+    #[test]
+    fn barrier_response_round_trips_without_clocks() {
+        let resp = Response {
+            version: VERSION,
+            result: RpcResult::Ok(BarrierResponse {
+                replica: "default".into(),
+                target_seq: 12,
+                synced: Some(SyncedStatus {
+                    seq: 12,
+                    completed_at: 1.5e9,
+                }),
+                pending: None,
+            }),
+        };
+        let line = serde_json::to_string(&resp).unwrap();
+        // No watchman clock ever appears on the wire.
+        assert!(!line.contains("clock"));
+        let back: Response<BarrierResponse> = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn barrier_coverage_judgement() {
+        let base = BarrierResponse {
+            replica: "default".into(),
+            target_seq: 10,
+            synced: None,
+            pending: None,
+        };
+        // Nothing synced, nothing known: not covered.
+        assert!(!base.is_covered());
+        // A sync covering a clock sequenced at/after the barrier's.
+        let synced = |seq: u64, files: Option<u64>| BarrierResponse {
+            synced: Some(SyncedStatus {
+                seq,
+                completed_at: 0.0,
+            }),
+            pending: files.map(|files| PendingStatus {
+                files,
+                fresh_instance: false,
+            }),
+            ..base.clone()
+        };
+        assert!(synced(10, None).is_covered());
+        assert!(synced(11, None).is_covered());
+        assert!(!synced(9, None).is_covered());
+        assert!(!synced(9, Some(3)).is_covered());
+        // An older sync with nothing pending since it: up-to-date as-of
+        // a moment at/after the barrier.
+        assert!(synced(9, Some(0)).is_covered());
     }
 
     #[test]

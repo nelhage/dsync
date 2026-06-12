@@ -86,10 +86,41 @@ fn status_outside_a_repo_fails_fast() {
 }
 
 #[test]
-fn barrier_is_stubbed_with_alias() {
-    assert_not_implemented(&["barrier"], "barrier");
-    assert_not_implemented(&["b"], "barrier");
-    assert_not_implemented(&["barrier", "--timeout", "1.5"], "barrier");
+fn barrier_outside_a_repo_fails_fast() {
+    let tmp = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["barrier"],
+        vec!["b"],
+        vec!["barrier", "--timeout", "1.5"],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_ds"))
+            .args(&args)
+            .current_dir(tmp.path())
+            .output()
+            .expect("failed to run ds");
+        assert!(!out.status.success(), "barrier outside a repo should fail");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("not inside a git repository"),
+            "stderr should explain the git requirement; got: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn barrier_rejects_a_negative_timeout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_ds"))
+        .args(["barrier", "--timeout=-1"])
+        .current_dir(tmp.path())
+        .output()
+        .expect("failed to run ds");
+    assert!(!out.status.success(), "negative timeout should be rejected");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("non-negative"),
+        "stderr should explain the timeout requirement; got: {stderr}"
+    );
 }
 
 #[test]

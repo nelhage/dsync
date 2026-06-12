@@ -2,6 +2,7 @@ use anyhow::bail;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+mod barrier;
 mod client;
 mod protocol;
 mod repo;
@@ -88,6 +89,10 @@ async fn main() -> anyhow::Result<()> {
     match &cli.command {
         Command::Sync { target } => cmd_sync(target).await,
         Command::Status => status::cmd_status().await,
+        Command::Barrier { timeout } => match barrier::cmd_barrier(*timeout).await? {
+            barrier::Outcome::Synced => Ok(()),
+            barrier::Outcome::TimedOut => std::process::exit(barrier::TIMEOUT_EXIT_CODE),
+        },
         _ => bail!("`ds {}` is not implemented yet", cli.command.name()),
     }
 }

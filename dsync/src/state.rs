@@ -11,6 +11,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
+use tokio::sync::watch;
 use watchman_client::prelude::Clock;
 
 use crate::target::Target;
@@ -50,6 +51,10 @@ pub struct ServerState {
     pub started_at: SystemTime,
     next_seq: AtomicU64,
     replicas: Mutex<BTreeMap<String, ReplicaState>>,
+    /// Bumped whenever any replica records a completed sync; parked
+    /// barrier requests subscribe to this and re-check their replica's
+    /// state on every wake-up.
+    synced_generation: watch::Sender<u64>,
 }
 
 impl ServerState {
@@ -59,6 +64,7 @@ impl ServerState {
             started_at: SystemTime::now(),
             next_seq: AtomicU64::new(1),
             replicas: Mutex::new(BTreeMap::new()),
+            synced_generation: watch::Sender::new(0),
         }
     }
 
@@ -97,6 +103,32 @@ impl ServerState {
     pub fn with_replica<T>(&self, name: &str, f: impl FnOnce(&mut ReplicaState) -> T) -> Option<T> {
         self.replicas.lock().unwrap().get_mut(name).map(f)
     }
+
+    /// Record a completed sync for one replica (clearing any in-flight
+    /// marker) and wake every waiter subscribed via [`subscribe_synced`].
+    ///
+    /// [`subscribe_synced`]: ServerState::subscribe_synced
+    pub fn record_synced(&self, name: &str, synced: SyncedClock) {
+        let updated = self
+            .with_replica(name, |r| {
+                r.syncing = None;
+                r.synced = Some(synced);
+            })
+            .is_some();
+        debug_assert!(updated, "record_synced for unknown replica {name:?}");
+        self.synced_generation.send_modify(|generation| {
+            *generation += 1;
+        });
+    }
+
+    /// Subscribe to sync completions: the receiver is marked changed every
+    /// time [`record_synced`] runs (for any replica — wake-ups re-check
+    /// state, so spurious ones are harmless).
+    ///
+    /// [`record_synced`]: ServerState::record_synced
+    pub fn subscribe_synced(&self) -> watch::Receiver<u64> {
+        self.synced_generation.subscribe()
+    }
 }
 
 #[cfg(test)]
@@ -130,5 +162,38 @@ mod tests {
         let snap = state.replica("default").unwrap();
         assert_eq!(snap.syncing.unwrap().seq, 3);
         assert!(snap.synced.is_none());
+    }
+
+    #[test]
+    fn record_synced_updates_state_and_wakes_subscribers() {
+        let state = ServerState::new();
+        state.add_replica("default", Target::Local("/tmp/replica".into()));
+        state.with_replica("default", |r| {
+            r.syncing = Some(SyncingClock {
+                seq: 4,
+                started_at: SystemTime::now(),
+            });
+        });
+
+        let mut rx = state.subscribe_synced();
+        rx.mark_unchanged();
+        assert!(!rx.has_changed().unwrap());
+
+        state.record_synced(
+            "default",
+            SyncedClock {
+                seq: 4,
+                clock: Clock::Spec(watchman_client::prelude::ClockSpec::default()),
+                completed_at: SystemTime::now(),
+            },
+        );
+
+        let snap = state.replica("default").unwrap();
+        assert_eq!(snap.synced.unwrap().seq, 4);
+        assert!(snap.syncing.is_none(), "syncing marker should be cleared");
+        assert!(
+            rx.has_changed().unwrap(),
+            "subscribers should be woken by record_synced"
+        );
     }
 }

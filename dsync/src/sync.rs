@@ -64,7 +64,16 @@ pub async fn run(repo_root: PathBuf, target: Target) -> Result<()> {
         client,
         root: resolved,
     });
-    let server = server::run(listener, Arc::clone(&state), Arc::clone(&watchman));
+    // Sequence-number grants for IPC-read clocks (e.g. `barrier`) are
+    // funneled through the reader task below so that sequence order always
+    // matches clock receipt order; see `SeqAssigner`.
+    let (seq_assigner, mut seq_requests) = server::seq_assigner();
+    let server = server::run(
+        listener,
+        Arc::clone(&state),
+        Arc::clone(&watchman),
+        seq_assigner,
+    );
 
     // Latest-value channel from the watchman reader to the sync runner: the
     // runner always syncs the newest observed event, so any number of
@@ -74,39 +83,52 @@ pub async fn run(repo_root: PathBuf, target: Target) -> Result<()> {
     let reader_state = Arc::clone(&state);
     let reader = async move {
         loop {
-            match subscription.next().await? {
-                SubscriptionData::FilesChanged(result) => {
-                    // Receipt order is clock order: tag each clock with the
-                    // next sequence number as it arrives.
-                    let seq = reader_state.next_seq();
-                    if result.is_fresh_instance {
-                        info!(
+            // `biased` polls top-to-bottom, so every already-delivered
+            // subscription notification is sequenced before any pending
+            // sequence-number grant: grants are therefore ordered after
+            // every clock that was received before them, which is what
+            // makes a granted seq a sound barrier target.
+            tokio::select! {
+                biased;
+                data = subscription.next() => match data? {
+                    SubscriptionData::FilesChanged(result) => {
+                        // Receipt order is clock order: tag each clock with
+                        // the next sequence number as it arrives.
+                        let seq = reader_state.next_seq();
+                        if result.is_fresh_instance {
+                            info!(
+                                seq,
+                                "watchman reports a fresh instance; scheduling full sync"
+                            );
+                        }
+                        let event = ChangeEvent {
                             seq,
-                            "watchman reports a fresh instance; scheduling full sync"
+                            clock: result.clock,
+                            files: result.files.as_ref().map(|f| f.len()),
+                        };
+                        debug!(seq, files = ?event.files, "change notification");
+                        tracing::trace!(
+                            seq,
+                            files = ?result.files.as_ref().map(|fs| {
+                                fs.iter().map(|f| f.name.display().to_string()).collect::<Vec<_>>()
+                            }),
+                            "changed files"
                         );
+                        if tx.send(Some(event)).is_err() {
+                            // The runner is gone; we are being torn down.
+                            return Ok(());
+                        }
                     }
-                    let event = ChangeEvent {
-                        seq,
-                        clock: result.clock,
-                        files: result.files.as_ref().map(|f| f.len()),
-                    };
-                    debug!(seq, files = ?event.files, "change notification");
-                    tracing::trace!(
-                        seq,
-                        files = ?result.files.as_ref().map(|fs| {
-                            fs.iter().map(|f| f.name.display().to_string()).collect::<Vec<_>>()
-                        }),
-                        "changed files"
-                    );
-                    if tx.send(Some(event)).is_err() {
-                        // The runner is gone; we are being torn down.
-                        return Ok(());
+                    SubscriptionData::Canceled => {
+                        bail!("watchman canceled our subscription (was the watch deleted?)");
                     }
+                    SubscriptionData::StateEnter { .. } | SubscriptionData::StateLeave { .. } => {}
+                },
+                Some(grant) = seq_requests.recv() => {
+                    // The requester may have given up (e.g. a dropped IPC
+                    // connection); a dead oneshot is fine.
+                    let _ = grant.send(reader_state.next_seq());
                 }
-                SubscriptionData::Canceled => {
-                    bail!("watchman canceled our subscription (was the watch deleted?)");
-                }
-                SubscriptionData::StateEnter { .. } | SubscriptionData::StateLeave { .. } => {}
             }
         }
     };
@@ -151,14 +173,14 @@ pub async fn run(repo_root: PathBuf, target: Target) -> Result<()> {
                         clock = ?event.clock,
                         "recorded synced clock"
                     );
-                    state.with_replica(DEFAULT_REPLICA, |r| {
-                        r.syncing = None;
-                        r.synced = Some(SyncedClock {
+                    state.record_synced(
+                        DEFAULT_REPLICA,
+                        SyncedClock {
                             seq: event.seq,
                             clock: event.clock,
                             completed_at: SystemTime::now(),
-                        });
-                    });
+                        },
+                    );
                 }
                 Err(err) => {
                     retrying = true;
