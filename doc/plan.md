@@ -19,19 +19,6 @@ Status as of 2026-06-12: docs only; no code exists yet. Start at Phase 0.
 - Workspace layout: a cargo workspace with members `dsync` (binary `ds`) and
   `dsync-ignore` (Phase 5).
 
-Environment notes (nelhage's macbook, arm64 macOS):
-
-- Rust: installed via rustup (stable 1.92.0), but `~/.cargo/bin` is NOT on
-  PATH in non-interactive shells — use `export PATH="$HOME/.cargo/bin:$PATH"`
-  or invoke cargo by full path.
-- **watchman is not installed.** Install (`brew install watchman`) before
-  Phase 1's integration tests can run.
-- rsync 3.4.1 and zstd are available on PATH. Caveat for the code itself:
-  stock macOS ships openrsync as `/usr/bin/rsync`, which doesn't support the
-  filter syntax we rely on (`--filter=':- .gitignore'`) — dsync should detect
-  the rsync flavor/version and error usefully, and tests must use a real
-  rsync ≥ 3.x.
-
 ## Phase 0 — Project scaffolding
 
 - Cargo project: binary named `ds`, crate named `dsync`.

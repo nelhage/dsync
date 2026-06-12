@@ -36,12 +36,7 @@ independent of the sync and IPC code).
 
 ## Environment & testing
 
-- `~/.cargo/bin` is not on PATH in non-interactive shells:
-  `export PATH="$HOME/.cargo/bin:$PATH"` (rustup, stable toolchain).
-- watchman must be installed for integration tests (`brew install watchman`);
-  it was not installed as of 2026-06-12.
-- Use a real rsync ≥ 3.x (on PATH here), not macOS's `/usr/bin/rsync`
-  (openrsync), which lacks the filter syntax we use.
+- `watchman`, `cargo` (and the entire Rust toolchain), and `rsync` are installed via a nix flake, and activated via `direnv`. If you run into version problems or don't have any of those dependencies, verify that you're picking up the `direnv` environment variables.
 - Integration tests drive the real binary against temp git repos with
   local-path sync targets — no ssh required. Wait via `ds barrier`, not
   sleeps. Property tests check ignore-rule translations directly against
