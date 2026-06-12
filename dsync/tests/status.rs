@@ -8,19 +8,17 @@ use std::process::Command;
 use std::time::Duration;
 
 mod common;
-use common::{Harness, git};
+use common::{Harness, git, raw_request};
 
-/// Connect to the harness's IPC socket and exchange one raw protocol line.
-fn raw_request(h: &Harness, line: &str) -> String {
-    let stream = UnixStream::connect(h.socket_path()).expect("connect to dsync.sock");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .unwrap();
-    let mut writer = stream.try_clone().unwrap();
-    writeln!(writer, "{line}").unwrap();
-    let mut response = String::new();
-    BufReader::new(stream).read_line(&mut response).unwrap();
-    response.trim_end().to_string()
+/// Run `ds status` and assert it reports the replica as up-to-date.
+fn assert_up_to_date(h: &Harness) {
+    let out = h.ds(&["status"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("up-to-date"),
+        "after a barrier with no further changes, status should be up-to-date; got: {stdout}"
+    );
 }
 
 #[test]
@@ -28,13 +26,7 @@ fn status_reports_up_to_date_then_tracks_changes() {
     let mut h = Harness::new();
     h.write("a.txt", "one\n");
     h.wait_for_file("a.txt", "one\n");
-
-    // The replica is up-to-date once the sync covering a.txt completes;
-    // poll for it (no barrier until Phase 3).
-    h.wait_until("ds status to report up-to-date", |h| {
-        let out = h.ds(&["status"]);
-        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("up-to-date")
-    });
+    assert_up_to_date(&h);
 
     let out = h.ds(&["status"]);
     assert!(out.status.success());
@@ -46,13 +38,10 @@ fn status_reports_up_to_date_then_tracks_changes() {
         "status should report replica, pid, and target; got: {stdout}"
     );
 
-    // More changes eventually converge back to up-to-date.
+    // More changes converge back to up-to-date.
     h.write("b.txt", "two\n");
     h.wait_for_file("b.txt", "two\n");
-    h.wait_until("ds status to report up-to-date again", |h| {
-        let out = h.ds(&["status"]);
-        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("up-to-date")
-    });
+    assert_up_to_date(&h);
 }
 
 #[test]
@@ -125,9 +114,12 @@ fn stale_socket_is_taken_over() {
     });
     h.write("a.txt", "one\n");
     h.wait_for_file("a.txt", "one\n");
-    h.wait_until("ds status to answer over the rebound socket", |h| {
-        h.ds(&["status"]).status.success()
-    });
+    let out = h.ds(&["status"]);
+    assert!(
+        out.status.success(),
+        "ds status should answer over the rebound socket; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]

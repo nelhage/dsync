@@ -63,12 +63,10 @@ fn gitignored_paths_are_skipped_and_remote_artifacts_survive() {
         write_file(&repo.join("target/build.out"), "local build\n");
         write_file(&repo.join("debug.log"), "noise\n");
     });
+    // The barrier inside wait_for_file guarantees a completed sync covers
+    // everything written above — including the ignored files, which that
+    // sync must have observed and skipped.
     h.wait_for_file("tracked.txt", "tracked\n");
-
-    // Force one more full sync round so we know a sync that observed the
-    // ignored files has completed before we assert on their absence.
-    h.write("tracked2.txt", "more\n");
-    h.wait_for_file("tracked2.txt", "more\n");
 
     assert!(
         !h.dest_path("target/build.out").exists(),
@@ -100,9 +98,6 @@ fn git_info_exclude_is_respected() {
 
     h.write("kept.txt", "kept\n");
     h.wait_for_file("kept.txt", "kept\n");
-
-    h.write("kept2.txt", "kept2\n");
-    h.wait_for_file("kept2.txt", "kept2\n");
 
     assert!(
         !h.dest_path("notes.scratch").exists(),

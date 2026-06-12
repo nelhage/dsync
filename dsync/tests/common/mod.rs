@@ -2,9 +2,12 @@
 //! destination directory, with a running `ds sync` child that is killed on
 //! drop. Drives the real binary, the real watchman, and the real rsync.
 //!
-//! `ds barrier` does not exist yet (Phase 3), so tests wait by polling for
-//! an expected state, with a generous deadline. Once the barrier lands, the
-//! harness should switch to it.
+//! Tests wait for synchronization via `ds barrier` (dogfooding the barrier
+//! mechanism — never via sleeps or sync-state polling): a barrier issued
+//! after a filesystem change returns only once a completed sync covers
+//! that change, so post-barrier assertions can be immediate. The only
+//! polling left is for server *startup* (waiting for the IPC socket to
+//! exist), which no barrier can cover.
 
 // Each test crate compiles its own copy of this module and uses a subset
 // of it.
@@ -34,6 +37,17 @@ impl Harness {
     /// and only then start `ds sync` — for tests whose assertions depend on
     /// state existing before the very first sync (e.g. `.gitignore` rules).
     pub fn with_setup(setup: impl FnOnce(&Path, &Path)) -> Harness {
+        Self::build(setup, false)
+    }
+
+    /// A harness whose `ds sync` child sees a broken `rsync` (a stub that
+    /// always fails), so no sync can ever complete — for testing timeout
+    /// behavior.
+    pub fn with_broken_rsync() -> Harness {
+        Self::build(|_repo, _dest| {}, true)
+    }
+
+    fn build(setup: impl FnOnce(&Path, &Path), break_rsync: bool) -> Harness {
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tmp.path().join("repo");
         let dest = tmp.path().join("dest");
@@ -44,8 +58,8 @@ impl Harness {
 
         let stderr_path = tmp.path().join("ds-sync.stderr");
         let stderr = std::fs::File::create(&stderr_path).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_ds"))
-            .args(["sync"])
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ds"));
+        cmd.args(["sync"])
             .arg(&dest)
             .current_dir(&repo)
             .stdin(Stdio::null())
@@ -56,9 +70,27 @@ impl Harness {
             // personal core.excludesFile must not affect what syncs).
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("XDG_CONFIG_HOME", tmp.path().join("xdg"))
-            .spawn()
-            .expect("failed to spawn ds sync");
+            .env("XDG_CONFIG_HOME", tmp.path().join("xdg"));
+        if break_rsync {
+            // Shadow rsync (and only rsync) with an always-failing stub;
+            // everything else (git, watchman) still resolves via PATH.
+            let bin = tmp.path().join("broken-bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let stub = bin.join("rsync");
+            std::fs::write(
+                &stub,
+                "#!/bin/sh\necho 'rsync: broken by test' >&2\nexit 1\n",
+            )
+            .unwrap();
+            let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+            std::fs::set_permissions(&stub, perms).unwrap();
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            let mut paths = vec![bin];
+            paths.extend(std::env::split_paths(&path));
+            cmd.env("PATH", std::env::join_paths(paths).unwrap());
+        }
+        let child = cmd.spawn().expect("failed to spawn ds sync");
 
         Harness {
             _tmp: tmp,
@@ -92,7 +124,8 @@ impl Harness {
     }
 
     /// Poll until `pred` holds, or panic (with the child's stderr) at the
-    /// deadline.
+    /// deadline. Only used for server *startup* (no barrier can cover it);
+    /// waiting for synchronization goes through [`Harness::barrier`].
     pub fn wait_until(&mut self, what: &str, pred: impl Fn(&Harness) -> bool) {
         let start = Instant::now();
         loop {
@@ -115,18 +148,54 @@ impl Harness {
         }
     }
 
-    /// Wait until `rel` exists in the destination with exactly `contents`.
-    pub fn wait_for_file(&mut self, rel: &str, contents: &str) {
-        let path = self.dest_path(rel);
-        self.wait_until(&format!("{rel} to sync"), |_| {
-            std::fs::read_to_string(&path).is_ok_and(|got| got == contents)
-        });
+    /// Run `ds barrier`: returns only once a completed sync covers every
+    /// change made before this call. Panics if the barrier fails or times
+    /// out. "No server is running" is retried within the deadline: it is
+    /// a startup condition (the child may not have bound — or, with a
+    /// stale leftover socket, rebound — the socket yet), not a sync state.
+    pub fn barrier(&mut self) {
+        self.wait_for_socket();
+        let start = Instant::now();
+        loop {
+            let out = self.ds(&["barrier", "--timeout", "30"]);
+            if out.status.success() {
+                return;
+            }
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(
+                stderr.contains("no ds sync is running") && start.elapsed() < DEADLINE,
+                "ds barrier failed ({}): {}\n--- ds sync stderr ---\n{}",
+                out.status,
+                stderr,
+                self.stderr()
+            );
+            std::thread::sleep(POLL);
+        }
     }
 
-    /// Wait until `rel` no longer exists in the destination.
-    pub fn wait_for_gone(&mut self, rel: &str) {
+    /// Barrier, then assert `rel` exists in the destination with exactly
+    /// `contents`.
+    pub fn wait_for_file(&mut self, rel: &str, contents: &str) {
+        self.barrier();
         let path = self.dest_path(rel);
-        self.wait_until(&format!("{rel} to be deleted"), |_| !path.exists());
+        match std::fs::read_to_string(&path) {
+            Ok(got) if got == contents => {}
+            got => panic!(
+                "after a barrier, {rel} should contain {contents:?}, got {got:?}\n--- ds sync stderr ---\n{}",
+                self.stderr()
+            ),
+        }
+    }
+
+    /// Barrier, then assert `rel` no longer exists in the destination.
+    pub fn wait_for_gone(&mut self, rel: &str) {
+        self.barrier();
+        let path = self.dest_path(rel);
+        assert!(
+            !path.exists(),
+            "after a barrier, {rel} should be deleted from the destination\n--- ds sync stderr ---\n{}",
+            self.stderr()
+        );
     }
 
     /// Wait until the IPC socket exists (the server holds the lock and has
@@ -153,6 +222,21 @@ impl Drop for Harness {
             .stderr(Stdio::null())
             .status();
     }
+}
+
+/// Connect to a harness's IPC socket and exchange one raw protocol line.
+pub fn raw_request(h: &Harness, line: &str) -> String {
+    use std::io::{BufRead, BufReader, Write};
+    let stream =
+        std::os::unix::net::UnixStream::connect(h.socket_path()).expect("connect to dsync.sock");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    writeln!(writer, "{line}").unwrap();
+    let mut response = String::new();
+    BufReader::new(stream).read_line(&mut response).unwrap();
+    response.trim_end().to_string()
 }
 
 pub fn git(repo: &Path, args: &[&str]) {
