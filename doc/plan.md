@@ -137,6 +137,28 @@ never parse or compare clock strings:
 
 ## Phase 5 — Ignore-rule engine and test suite
 
+**Status: done (2026-06-12).** `dsync-ignore` implements the gitignore
+pattern parser/matcher, the layered `IgnoreSet` evaluator (global excludes →
+`.git/info/exclude` → `.gitignore` walk → `.dsyncexclude`, with built-in
+non-overridable root `.git`/`.dsync` excludes), `load_repo()`, and both
+translations: `rsync_filter_rules()` (supports negation; expands each
+non-trailing `**` into two variants because rsync's `**` can't match zero
+components) and `watchman_ignored_files_expr()` /
+`watchman_synced_files_expr()` (wholename `match` terms with
+`includedotfiles`; negated patterns return
+`TranslateError::UnsupportedNegation`). Property tests compare the evaluator
+against `git ls-files -o -i --exclude-standard`, the rsync translation
+against `rsync --list-only`, and the watchman translation against
+`watchman query`; all pass at 10× default case counts. Notes for
+integration (Phases 1/6): treat any `TranslateError` as uncertainty → full
+rsync; the `.dsyncexclude` name is now concrete
+(`dsync_ignore::DSYNC_EXCLUDE_FILE`); accepted divergences are documented in
+the crate docs (`dsync-ignore/src/lib.rs`) — notably no watchman translation
+for `!` patterns, and `.dsyncexclude` re-includes don't resurrect
+`.gitignore` files inside git-ignored dirs. `load_repo` takes the
+`core.excludesFile` *contents* as a parameter; resolving the config is the
+caller's job.
+
 This is the highest-risk component; it gets its own phase. It is also largely
 independent of Phases 1–4: it lives in its own workspace sub-crate (e.g.
 `dsync-ignore`) exposing generic APIs for parsing and translating ignore
