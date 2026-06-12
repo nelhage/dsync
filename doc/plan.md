@@ -6,9 +6,12 @@ earlier ones. Design decisions made along the way are recorded at the end.
 
 ## Notes for implementation sessions
 
-Status as of 2026-06-12: Phases 0–4 complete; Phases 5+ not started (a
-Phase 5 agent may already be running in parallel — the `dsync-ignore` stub
-crate exists).
+Status as of 2026-06-12: Phases 0–5 complete (Phase 5 was built in
+parallel and is merged). The `dsync` crate still uses its interim Phase 1
+ignore handling (rsync `:- .gitignore` dir-merge, `.git`/`.dsync`-only
+watchman exclusion); wiring `dsync-ignore` into the sync loop and the
+status/barrier since-queries lands with Phase 6, which needs the watchman
+translation anyway.
 
 - [dsync.md](dsync.md) is the authoritative behavior spec; this file covers
   sequencing and recorded decisions. The Decisions section at the bottom was
@@ -271,7 +274,12 @@ components) and `watchman_ignored_files_expr()` /
 `TranslateError::UnsupportedNegation`). Property tests compare the evaluator
 against `git ls-files -o -i --exclude-standard`, the rsync translation
 against `rsync --list-only`, and the watchman translation against
-`watchman query`; all pass at 10× default case counts. Notes for
+`watchman query`; all pass at 10× default case counts. (Post-merge, the
+property suite caught one more watchman-translation bug: for patterns
+ending in `**`, the files-under term naively appended `/**`, and watchman
+collapses `**/**` to a single `**` — weaker than gitignore's trailing
+`**`. Fixed by substituting `*/**` for the trailing `**`; pinned by unit
+and regression tests.) Notes for
 integration (Phases 1/6): treat any `TranslateError` as uncertainty → full
 rsync; the `.dsyncexclude` name is now concrete
 (`dsync_ignore::DSYNC_EXCLUDE_FILE`); accepted divergences are documented in

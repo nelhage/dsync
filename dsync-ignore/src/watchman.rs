@@ -45,8 +45,20 @@ pub fn watchman_ignored_files_expr(set: &IgnoreSet) -> Result<Value, TranslateEr
                 terms.push(match_term(&glob));
             }
             // Files under a directory matched by the pattern. (For a file,
-            // `glob + "/**"` simply matches nothing.)
-            terms.push(match_term(&format!("{glob}/**")));
+            // `glob + "/**"` simply matches nothing.) When the pattern itself
+            // ends in `**`, naively appending `/**` would yield `**/**`,
+            // which watchman collapses to a single `**` (the first may match
+            // zero segments) — weaker than gitignore's trailing `**`, which
+            // matches one or more segments. Substitute `*` for the trailing
+            // `**` instead: one segment for the matched directory's required
+            // interior component, then `/**` for the file(s) beneath it.
+            let under = if pat.segments.last() == Some(&Segment::DoubleStar) {
+                let head = glob.strip_suffix("**").expect("DoubleStar renders as **");
+                format!("{head}*/**")
+            } else {
+                format!("{glob}/**")
+            };
+            terms.push(match_term(&under));
         }
     }
     let mut expr = vec![Value::from("anyof")];
@@ -129,6 +141,33 @@ mod tests {
         assert_eq!(
             arr[7],
             json!(["match", "sub/**/*.tmp/**", "wholename", {"includedotfiles": true}])
+        );
+    }
+
+    #[test]
+    fn trailing_doublestar_requires_interior_segment() {
+        // `??/**/` matches directories strictly *inside* a `??` directory;
+        // the files-under term must therefore require two segments past the
+        // `??`. Appending `/**` naively would give `??/**/**`, which
+        // watchman's wildmatch collapses to a single `**` (one segment).
+        let e = expr(&[("", "??/**/\n")]).unwrap();
+        let arr = e.as_array().unwrap();
+        assert_eq!(arr.len(), 1 + 4 + 1);
+        assert_eq!(
+            arr[5],
+            json!(["match", "??/*/**", "wholename", {"includedotfiles": true}])
+        );
+        // Non-dir-only: the direct term keeps the trailing `**` (one or more
+        // segments inside), and the under-term still requires two.
+        let e = expr(&[("", "abc/**\n")]).unwrap();
+        let arr = e.as_array().unwrap();
+        assert_eq!(
+            arr[5],
+            json!(["match", "abc/**", "wholename", {"includedotfiles": true}])
+        );
+        assert_eq!(
+            arr[6],
+            json!(["match", "abc/*/**", "wholename", {"includedotfiles": true}])
         );
     }
 

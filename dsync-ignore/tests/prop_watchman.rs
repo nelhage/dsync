@@ -42,6 +42,32 @@ proptest! {
     }
 }
 
+/// Regression (found by the property test): a dir-only pattern ending in
+/// `**` (`??/**/`) must not ignore files directly inside the `??` directory.
+/// The naive files-under translation appended `/**`, and watchman collapses
+/// `**/**` to a single `**`, wrongly matching `cc/a`.
+#[test]
+fn trailing_doublestar_dir_pattern() {
+    let case = common::Case {
+        files: ["cc/a", "cc/d/f"].iter().map(|s| s.to_string()).collect(),
+        gitignores: [(String::new(), "??/**/\n".to_string())]
+            .into_iter()
+            .collect(),
+        dsyncexclude: None,
+    };
+    let tmp = common::materialize(&case);
+    let root = tmp.path();
+    common::git_init(root);
+    let set = dsync_ignore::load_repo(root, None).expect("load_repo");
+    let expr = dsync_ignore::watchman_synced_files_expr(&set).expect("translate");
+    let queried = common::watchman_query_files(root, &expr);
+    let expected: BTreeSet<String> = [".gitignore", "cc/a"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(queried, expected);
+}
+
 /// The documented divergence: rule sets containing `!` patterns refuse to
 /// translate, so the fast path can fall back to a full rsync.
 #[test]
