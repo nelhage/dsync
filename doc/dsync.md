@@ -25,7 +25,9 @@ Shows the status of all running `dsync sync` processes. PID, whether or not they
 
 ### `ds barrier` (`ds b`)
 
-Blocks until `ds sync` is up-to-date as-of the `ds barrier` invocation. Reads a [watchman timestamp][clock] (using a [synchronization cookie][cookie]), and performs an IPC to the sync process using that timestamp.
+Blocks until `ds sync` is up-to-date as-of the `ds barrier` invocation. Performs an RPC to the sync process, which reads a [watchman timestamp][clock] (using a [synchronization cookie][cookie]) on the client's behalf, and replies once it has synced as-of that timestamp.
+
+(Optional future enhancement: a client might want to observe a clock at time T0, do unrelated work, and then barrier as-of T0, pipelining synchronization against that work. If a concrete use case appears, we can implement this by layering our own logical clock on top of the RPC, without exposing watchman clocks to clients.)
 
 [clock]: https://facebook.github.io/watchman/docs/cmd/clock
 [cookie]: https://facebook.github.io/watchman/docs/cookies
@@ -42,16 +44,21 @@ Runs a command over ssh on the remote host, with the remote replica as its CWD. 
 
 ### Watchman clock
 
-`ds status` fetches the current `watchman` clock, and then performs an IPC call to talk to each server. The server's response indicates:
+All watchman clock handling lives in the `ds sync` server. Clocks are treated as fully opaque -- never parsed or compared as strings -- and clients never observe them. Internally, the server orders clocks by receipt: all clocks arrive serially over its single watchman connection, and within a watchman instance, send order is clock order, so a local monotonic sequence number suffices for ordering. A watchman instance restart surfaces as `is_fresh_instance` on the subscription, which triggers a full resync.
+
+`ds status` performs an IPC call to talk to each server. The server's response indicates:
 
 - The server's "up-to-date-as-of" watchman clock, and the wall-clock time at which that sync completed.
 - (optional) `currently_syncing`, the watchman clock for which a sync is currently running.
+- Up-to-dateness, computed server-side via a cookie-synchronized watchman `since` query against the up-to-date-as-of clock -- which also yields a count of files pending sync.
 
-The client can then compare those two clock values, plus the one it observed, to deduce the state of the world. Note that we always send "state" information which describes the current state of the world, not transient "am I up to date?" flags. Working in this way allows for more unambiguous reconstruction of state, and for interpreting state across time in a clearer way.
+Note that we always send "state" information which describes the current state of the world, not transient "am I up to date?" flags. Working in this way allows for more unambiguous reconstruction of state, and for interpreting state across time in a clearer way.
 
 ### Ignore/exclude lists
 
-`ds sync`, by default, respects git's ignore lists. It reads them in and converts them to `rsync` exclude rules when doing the sync. It runs rsync with `--delete --delete-excluded`, although it will likely provide flags to toggle that behavior.
+`ds sync`, by default, respects git's ignore lists. It reads them in and converts them to `rsync` exclude rules when doing the sync. It runs rsync with `--delete`, although it will likely provide flags to toggle that behavior. `--delete-excluded` is **not** the default (and may not be supported at all): ignored paths are neither sent nor deleted, so remote-only build artifacts (e.g. a gitignored `target/`) survive syncs.
+
+`.git` itself is never synced. As an optional future extension, we may add support for synchronizing git state **via git itself** -- e.g. pushing over objects, managing the remote `HEAD` -- but we would do so via `git`, so as to not clobber existing objects and refs.
 
 It will supports an additional include/exclude list, to override behavior relative to `git`; this may take the form of a `.dsyncexclude` file or something; details to be determined later.
 
