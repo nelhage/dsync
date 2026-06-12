@@ -2,6 +2,12 @@ use anyhow::bail;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+mod repo;
+mod sync;
+mod target;
+
+use target::Target;
+
 /// Sync a git repository to a remote (or local-path) replica, driven by
 /// watchman.
 #[derive(Debug, Parser)]
@@ -54,6 +60,13 @@ impl Command {
     }
 }
 
+async fn cmd_sync(target: &str) -> anyhow::Result<()> {
+    let target = Target::parse(target)?;
+    let repo_root = repo::find_repo_root(&std::env::current_dir()?)?;
+    target.validate_against_repo(&repo_root)?;
+    sync::run(repo_root, target).await
+}
+
 fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -67,7 +80,10 @@ fn init_tracing() {
 async fn main() -> anyhow::Result<()> {
     init_tracing();
     let cli = Cli::parse();
-    bail!("`ds {}` is not implemented yet", cli.command.name());
+    match &cli.command {
+        Command::Sync { target } => cmd_sync(target).await,
+        _ => bail!("`ds {}` is not implemented yet", cli.command.name()),
+    }
 }
 
 #[cfg(test)]

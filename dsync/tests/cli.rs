@@ -1,5 +1,6 @@
-//! Integration tests for the `ds` CLI skeleton: every subcommand exists
-//! (including its aliases), and the unimplemented ones fail loudly.
+//! Integration tests for the `ds` CLI surface: every subcommand exists
+//! (including its aliases), unimplemented ones fail loudly, and bad `sync`
+//! invocations fail fast. End-to-end sync behavior is covered in `sync.rs`.
 
 use std::process::{Command, Output};
 
@@ -42,17 +43,27 @@ fn no_subcommand_is_a_usage_error() {
 }
 
 #[test]
-fn sync_is_stubbed() {
-    assert_not_implemented(&["sync", "host:/tmp/replica"], "sync");
-    assert_not_implemented(&["sync", "/tmp/replica"], "sync");
-}
-
-#[test]
 fn sync_requires_a_target() {
     let out = ds(&["sync"]);
     assert!(
         !out.status.success(),
         "`ds sync` without TARGET should fail"
+    );
+}
+
+#[test]
+fn sync_outside_a_repo_fails_fast() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_ds"))
+        .args(["sync", "host:/tmp/replica"])
+        .current_dir(tmp.path())
+        .output()
+        .expect("failed to run ds");
+    assert!(!out.status.success(), "sync outside a repo should fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not inside a git repository"),
+        "stderr should explain the git requirement; got: {stderr}"
     );
 }
 
