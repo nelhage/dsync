@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    name: build / test / clippy / fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The nix dev shell provides the full toolchain, including the
+      # watchman and rsync binaries the integration tests need.
+      - uses: DeterminateSystems/nix-installer-action@v16
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: cargo build
+        run: nix develop --command cargo build --workspace --all-targets
+
+      - name: cargo test
+        run: nix develop --command cargo test --workspace
+
+      - name: cargo clippy
+        run: nix develop --command cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo fmt
+        run: nix develop --command cargo fmt --all --check
+
+      - name: watchman is available
+        run: nix develop --command watchman --version
