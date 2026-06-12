@@ -68,10 +68,21 @@ fn sync_outside_a_repo_fails_fast() {
 }
 
 #[test]
-fn status_is_stubbed_with_aliases() {
-    assert_not_implemented(&["status"], "status");
-    assert_not_implemented(&["stat"], "status");
-    assert_not_implemented(&["s"], "status");
+fn status_outside_a_repo_fails_fast() {
+    let tmp = tempfile::tempdir().unwrap();
+    for args in [["status"], ["stat"], ["s"]] {
+        let out = Command::new(env!("CARGO_BIN_EXE_ds"))
+            .args(args)
+            .current_dir(tmp.path())
+            .output()
+            .expect("failed to run ds");
+        assert!(!out.status.success(), "status outside a repo should fail");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("not inside a git repository"),
+            "stderr should explain the git requirement; got: {stderr}"
+        );
+    }
 }
 
 #[test]

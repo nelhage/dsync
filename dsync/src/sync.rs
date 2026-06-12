@@ -3,6 +3,7 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
@@ -11,6 +12,9 @@ use tracing::{debug, error, info, warn};
 use watchman_client::SubscriptionData;
 use watchman_client::prelude::*;
 
+use crate::protocol::DEFAULT_REPLICA;
+use crate::server::{self, Watchman};
+use crate::state::{ServerState, SyncedClock, SyncingClock};
 use crate::target::Target;
 
 /// How long to let the filesystem settle after a change notification before
@@ -19,18 +23,6 @@ const SETTLE_WINDOW: Duration = Duration::from_millis(75);
 
 /// How long to wait before retrying after a failed sync.
 const RETRY_DELAY: Duration = Duration::from_secs(2);
-
-/// The record of a completed sync: the watchman clock it covers (opaque;
-/// ordered only by `seq`, the receipt-order sequence number assigned when
-/// the clock arrived over our watchman connection) and when it finished.
-#[derive(Debug, Clone)]
-pub struct SyncedClock {
-    pub seq: u64,
-    #[allow(dead_code)] // Consumed by `ds status`/`ds barrier` in later phases.
-    pub clock: Clock,
-    #[allow(dead_code)]
-    pub completed_at: SystemTime,
-}
 
 /// A change notification from watchman, tagged with its receipt-order
 /// sequence number.
@@ -42,8 +34,14 @@ struct ChangeEvent {
 }
 
 /// Run `ds sync`: subscribe to watchman and rsync the repository to
-/// `target` on every (settled) change, forever.
+/// `target` on every (settled) change, forever, while serving IPC requests
+/// on `.dsync/dsync.sock`.
 pub async fn run(repo_root: PathBuf, target: Target) -> Result<()> {
+    // Take the instance lock and bind the socket first, so a second
+    // `ds sync` in the same repo fails fast with "already running".
+    let control = server::ControlDir::acquire(&repo_root)?;
+    let listener = control.bind_socket()?;
+
     let client = Connector::new()
         .connect()
         .await
@@ -60,17 +58,27 @@ pub async fn run(repo_root: PathBuf, target: Target) -> Result<()> {
         .context("watchman subscribe failed")?;
     info!("watching {} -> {}", repo_root.display(), target);
 
+    let state = Arc::new(ServerState::new());
+    state.add_replica(DEFAULT_REPLICA, target.clone());
+    let watchman = Arc::new(Watchman {
+        client,
+        root: resolved,
+    });
+    let server = server::run(listener, Arc::clone(&state), Arc::clone(&watchman));
+
     // Latest-value channel from the watchman reader to the sync runner: the
     // runner always syncs the newest observed event, so any number of
     // changes arriving mid-sync coalesce into at most one pending follow-up.
     let (tx, mut rx) = watch::channel::<Option<ChangeEvent>>(None);
 
+    let reader_state = Arc::clone(&state);
     let reader = async move {
-        let mut seq: u64 = 0;
         loop {
             match subscription.next().await? {
                 SubscriptionData::FilesChanged(result) => {
-                    seq += 1;
+                    // Receipt order is clock order: tag each clock with the
+                    // next sequence number as it arrives.
+                    let seq = reader_state.next_seq();
                     if result.is_fresh_instance {
                         info!(
                             seq,
@@ -104,7 +112,6 @@ pub async fn run(repo_root: PathBuf, target: Target) -> Result<()> {
     };
 
     let runner = async move {
-        let mut last_synced: Option<SyncedClock> = None;
         let mut retrying = false;
         loop {
             if retrying {
@@ -124,6 +131,12 @@ pub async fn run(repo_root: PathBuf, target: Target) -> Result<()> {
                 Some(n) => info!(seq = event.seq, "sync started ({n} files changed)"),
                 None => info!(seq = event.seq, "sync started"),
             }
+            state.with_replica(DEFAULT_REPLICA, |r| {
+                r.syncing = Some(SyncingClock {
+                    seq: event.seq,
+                    started_at: SystemTime::now(),
+                });
+            });
             let started = Instant::now();
             match run_rsync(&repo_root, &target).await {
                 Ok(()) => {
@@ -134,19 +147,22 @@ pub async fn run(repo_root: PathBuf, target: Target) -> Result<()> {
                         started.elapsed()
                     );
                     debug!(
-                        prev_seq = last_synced.as_ref().map(|s| s.seq),
-                        new_seq = event.seq,
+                        seq = event.seq,
                         clock = ?event.clock,
                         "recorded synced clock"
                     );
-                    last_synced = Some(SyncedClock {
-                        seq: event.seq,
-                        clock: event.clock,
-                        completed_at: SystemTime::now(),
+                    state.with_replica(DEFAULT_REPLICA, |r| {
+                        r.syncing = None;
+                        r.synced = Some(SyncedClock {
+                            seq: event.seq,
+                            clock: event.clock,
+                            completed_at: SystemTime::now(),
+                        });
                     });
                 }
                 Err(err) => {
                     retrying = true;
+                    state.with_replica(DEFAULT_REPLICA, |r| r.syncing = None);
                     error!(
                         seq = event.seq,
                         "sync failed after {:.2?}: {err:#}; retrying in {RETRY_DELAY:?}",
@@ -157,10 +173,12 @@ pub async fn run(repo_root: PathBuf, target: Target) -> Result<()> {
         }
     };
 
-    // Both futures run forever; whichever errors first ends the process.
+    // All three futures run forever; whichever errors first ends the
+    // process.
     tokio::select! {
         result = reader => result,
         result = runner => result,
+        result = server => result,
     }
 }
 

@@ -2,7 +2,12 @@ use anyhow::bail;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+mod client;
+mod protocol;
 mod repo;
+mod server;
+mod state;
+mod status;
 mod sync;
 mod target;
 
@@ -82,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match &cli.command {
         Command::Sync { target } => cmd_sync(target).await,
+        Command::Status => status::cmd_status().await,
         _ => bail!("`ds {}` is not implemented yet", cli.command.name()),
     }
 }
