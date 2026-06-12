@@ -50,6 +50,11 @@
 //!   otherwise, while git itself would treat it as a repository boundary.
 //! - **Unreadable ignore files**: git treats an unreadable `.gitignore` as
 //!   empty; [`load_repo`] propagates the I/O error (except `NotFound`).
+//! - **`.dsyncexclude` re-includes don't resurrect inner `.gitignore`
+//!   files.** Which `.gitignore` files get *read* is decided by git's rules
+//!   alone (git never reads ignore files inside directories it ignores); a
+//!   `.dsyncexclude` re-include of such a directory re-includes its
+//!   contents, but any `.gitignore` inside it stays unread.
 
 mod eval;
 mod pattern;

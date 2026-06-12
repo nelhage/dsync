@@ -152,6 +152,25 @@ mod tests {
     }
 
     #[test]
+    fn dsyncexclude_reinclude_does_not_resurrect_inner_gitignore() {
+        // Documented divergence: which .gitignore files are *read* is decided
+        // by git's rules alone. A .dsyncexclude re-include of a git-ignored
+        // dir re-includes its contents, but its inner .gitignore stays
+        // unread.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(root, ".gitignore", "build/\n");
+        write(root, "build/.gitignore", "*.o\n");
+        write(root, ".dsyncexclude", "!build/\n");
+
+        let set = load_repo(root, None).unwrap();
+        assert!(!set.is_ignored("build", true));
+        assert!(!set.is_ignored("build/main.c", false));
+        // build/.gitignore was not loaded, so *.o under build is synced.
+        assert!(!set.is_ignored("build/main.o", false));
+    }
+
+    #[test]
     fn gitdir_file_indirection() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
