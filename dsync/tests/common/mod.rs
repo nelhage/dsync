@@ -37,14 +37,14 @@ impl Harness {
     /// and only then start `ds sync` — for tests whose assertions depend on
     /// state existing before the very first sync (e.g. `.gitignore` rules).
     pub fn with_setup(setup: impl FnOnce(&Path, &Path)) -> Harness {
-        Self::build(setup, false, None)
+        Self::build(setup, false, None, &[])
     }
 
     /// A harness whose `ds sync` child sees a broken `rsync` (a stub that
     /// always fails), so no sync can ever complete — for testing timeout
     /// behavior.
     pub fn with_broken_rsync() -> Harness {
-        Self::build(|_repo, _dest| {}, true, None)
+        Self::build(|_repo, _dest| {}, true, None, &[])
     }
 
     /// A harness that syncs over ssh: the target is `HOST:DEST` where DEST
@@ -52,13 +52,21 @@ impl Harness {
     /// destination keep working when HOST is the local machine (e.g.
     /// `localhost`). Requires non-interactive ssh to HOST.
     pub fn with_ssh_host(host: &str) -> Harness {
-        Self::build(|_repo, _dest| {}, false, Some(host.to_string()))
+        Self::build(|_repo, _dest| {}, false, Some(host.to_string()), &[])
+    }
+
+    /// A harness whose `ds sync` child runs with extra environment variables
+    /// — e.g. `DSYNC_HEAL_INTERVAL_MS` to exercise the periodic self-heal
+    /// without a 5-minute wait.
+    pub fn with_env(env: &[(&str, &str)]) -> Harness {
+        Self::build(|_repo, _dest| {}, false, None, env)
     }
 
     fn build(
         setup: impl FnOnce(&Path, &Path),
         break_rsync: bool,
         ssh_host: Option<String>,
+        extra_env: &[(&str, &str)],
     ) -> Harness {
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tmp.path().join("repo");
@@ -87,6 +95,7 @@ impl Harness {
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("XDG_CONFIG_HOME", tmp.path().join("xdg"));
+        cmd.envs(extra_env.iter().copied());
         if break_rsync {
             // Shadow rsync (and only rsync) with an always-failing stub;
             // everything else (git, watchman) still resolves via PATH.

@@ -26,6 +26,22 @@ const SETTLE_WINDOW: Duration = Duration::from_millis(75);
 /// How long to wait before retrying after a failed sync.
 const RETRY_DELAY: Duration = Duration::from_secs(2);
 
+/// How often to force a full rsync as a self-healing measure, repairing any
+/// drift the fast path might have left, even while changes keep flowing.
+const HEAL_INTERVAL: Duration = Duration::from_secs(300);
+
+/// The self-heal interval, overridable via `DSYNC_HEAL_INTERVAL_MS` (an
+/// internal knob, used by the integration tests to avoid a 5-minute wait).
+fn heal_interval() -> Duration {
+    match std::env::var("DSYNC_HEAL_INTERVAL_MS") {
+        Ok(ms) => ms
+            .parse()
+            .map(Duration::from_millis)
+            .unwrap_or(HEAL_INTERVAL),
+        Err(_) => HEAL_INTERVAL,
+    }
+}
+
 /// A change notification from watchman, tagged with its receipt-order
 /// sequence number.
 #[derive(Debug, Clone)]
@@ -150,18 +166,44 @@ pub async fn run(repo_root: PathBuf, target: Target) -> Result<()> {
     let compression = fastpath::detect_compression(&target).await;
 
     let runner = async move {
+        let ctx = SyncCtx {
+            repo_root: &repo_root,
+            target: &target,
+            watchman: &runner_watchman,
+            compression,
+        };
         let mut retrying = false;
+        let mut force_full = false;
+        // Fire the first self-heal one interval from now, not immediately.
+        let interval = heal_interval();
+        let mut heal = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+        heal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             if retrying {
                 tokio::time::sleep(RETRY_DELAY).await;
             } else {
-                if rx.changed().await.is_err() {
-                    bail!("watchman event stream ended");
+                tokio::select! {
+                    changed = rx.changed() => {
+                        if changed.is_err() {
+                            bail!("watchman event stream ended");
+                        }
+                        tokio::time::sleep(SETTLE_WINDOW).await;
+                    }
+                    _ = heal.tick() => {
+                        // Periodic self-heal: re-sync the latest known state
+                        // with a full rsync. Skip if nothing has synced yet
+                        // (no state to repair).
+                        if rx.borrow().is_none() {
+                            continue;
+                        }
+                        force_full = true;
+                        debug!("periodic self-heal: forcing a full rsync");
+                    }
                 }
-                tokio::time::sleep(SETTLE_WINDOW).await;
             }
             // Take the *latest* event (newer notifications may have arrived
             // during the settle window, the previous sync, or a retry delay).
+            // On a self-heal tick this is the last event, re-synced in full.
             let Some(event) = rx.borrow_and_update().clone() else {
                 continue;
             };
@@ -187,19 +229,10 @@ pub async fn run(repo_root: PathBuf, target: Target) -> Result<()> {
                 .replica(DEFAULT_REPLICA)
                 .and_then(|r| r.synced.map(|s| s.clock));
             let started = Instant::now();
-            match sync_once(
-                &repo_root,
-                &target,
-                &runner_watchman,
-                &rules,
-                prev_clock.as_ref(),
-                &event,
-                compression,
-            )
-            .await
-            {
+            match sync_once(&ctx, &rules, prev_clock.as_ref(), &event, force_full).await {
                 Ok(mode) => {
                     retrying = false;
+                    force_full = false;
                     info!(
                         seq = event.seq,
                         "{mode} sync finished in {:.2?}",
@@ -244,25 +277,41 @@ pub async fn run(repo_root: PathBuf, target: Target) -> Result<()> {
 /// Run one sync of the latest `event`, taking the small-change fast path
 /// when it is eligible and falling back to a full rsync otherwise (or when
 /// the fast path declines or errors). Returns a label for logging.
+/// The loop-invariant context for a sync: where we sync from and to, over
+/// which watchman connection, and how the fast path compresses.
+struct SyncCtx<'a> {
+    repo_root: &'a Path,
+    target: &'a Target,
+    watchman: &'a Watchman,
+    compression: Compression,
+}
+
 async fn sync_once(
-    repo_root: &Path,
-    target: &Target,
-    watchman: &Watchman,
+    ctx: &SyncCtx<'_>,
     rules: &Rules,
     prev_clock: Option<&Clock>,
     event: &ChangeEvent,
-    compression: Compression,
+    force_full: bool,
 ) -> Result<&'static str> {
     // The fast path is eligible only when the work can be bounded precisely:
-    // a prior completed sync to query since, no fresh instance, a rule set
-    // watchman can express, and a notification small enough to be worth it.
-    if let Some(since) = prev_clock
+    // not a forced self-heal, a prior completed sync to query since, no fresh
+    // instance, a rule set watchman can express, and a notification small
+    // enough to be worth it.
+    if !force_full
+        && let Some(since) = prev_clock
         && !event.fresh_instance
         && let Some(ignored) = rules.ignored_expr()
         && event.files.is_none_or(|n| n <= fastpath::MAX_FILES)
     {
-        match fastpath::try_fast_path(repo_root, target, watchman, ignored, since, compression)
-            .await
+        match fastpath::try_fast_path(
+            ctx.repo_root,
+            ctx.target,
+            ctx.watchman,
+            ignored,
+            since,
+            ctx.compression,
+        )
+        .await
         {
             Ok(fastpath::Outcome::Applied) => return Ok("fast"),
             // The correctness valve: any uncertainty falls back to a full
@@ -281,7 +330,7 @@ async fn sync_once(
             }
         }
     }
-    run_rsync(repo_root, target, rules).await?;
+    run_rsync(ctx.repo_root, ctx.target, rules).await?;
     Ok("full")
 }
 

@@ -7,6 +7,8 @@
 //! each test first drives one sync to completion, then asserts the *next*
 //! sync's mode.
 
+use std::time::{Duration, Instant};
+
 mod common;
 use common::{Harness, write_file};
 
@@ -133,4 +135,28 @@ fn oversized_change_falls_back_to_full_rsync() {
         "an oversized change should fall back to a full rsync\n--- stderr ---\n{}",
         h.stderr()
     );
+}
+
+#[test]
+fn periodic_self_heal_runs_a_full_rsync() {
+    // A short heal interval so we don't wait the production 5 minutes.
+    let mut h = Harness::with_env(&[("DSYNC_HEAL_INTERVAL_MS", "150")]);
+    h.write("a.txt", "one\n");
+    h.wait_for_file("a.txt", "one\n"); // startup: full rsync
+
+    let full_before = full_count(&h);
+
+    // Make no further changes: a full rsync must still fire on the timer.
+    let start = Instant::now();
+    loop {
+        if full_count(&h) > full_before {
+            break; // a self-heal ran
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "no self-heal full rsync fired within the deadline\n--- stderr ---\n{}",
+            h.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
