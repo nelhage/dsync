@@ -12,6 +12,7 @@ use tracing::{debug, error, info, warn};
 use watchman_client::SubscriptionData;
 use watchman_client::prelude::*;
 
+use crate::ignore::Rules;
 use crate::protocol::DEFAULT_REPLICA;
 use crate::server::{self, Watchman};
 use crate::state::{ServerState, SyncedClock, SyncingClock};
@@ -64,6 +65,10 @@ pub async fn run(repo_root: PathBuf, target: Target) -> Result<()> {
         client,
         root: resolved,
     });
+    // The repository's ignore rules, shared with the IPC server (which
+    // filters its since-queries against them) and reloaded by the runner
+    // whenever an ignore file changes.
+    let (rules_tx, rules_rx) = watch::channel(Arc::new(Rules::load(&repo_root)));
     // Sequence-number grants for IPC-read clocks (e.g. `barrier`) are
     // funneled through the reader task below so that sequence order always
     // matches clock receipt order; see `SeqAssigner`.
@@ -72,6 +77,7 @@ pub async fn run(repo_root: PathBuf, target: Target) -> Result<()> {
         listener,
         Arc::clone(&state),
         Arc::clone(&watchman),
+        rules_rx,
         seq_assigner,
     );
 
@@ -149,6 +155,11 @@ pub async fn run(repo_root: PathBuf, target: Target) -> Result<()> {
             let Some(event) = rx.borrow_and_update().clone() else {
                 continue;
             };
+            // Reload the ignore rules so edits to `.gitignore` /
+            // `.dsyncexclude` take effect, and publish them to the IPC
+            // server (whose since-queries filter against them).
+            let rules = Arc::new(Rules::load(&repo_root));
+            let _ = rules_tx.send(Arc::clone(&rules));
             match event.files {
                 Some(n) => info!(seq = event.seq, "sync started ({n} files changed)"),
                 None => info!(seq = event.seq, "sync started"),
@@ -160,7 +171,7 @@ pub async fn run(repo_root: PathBuf, target: Target) -> Result<()> {
                 });
             });
             let started = Instant::now();
-            match run_rsync(&repo_root, &target).await {
+            match run_rsync(&repo_root, &target, &rules).await {
                 Ok(()) => {
                     retrying = false;
                     info!(
@@ -204,8 +215,14 @@ pub async fn run(repo_root: PathBuf, target: Target) -> Result<()> {
     }
 }
 
-/// Run one full-tree rsync of `repo_root` to `target`.
-async fn run_rsync(repo_root: &Path, target: &Target) -> Result<()> {
+/// Run one full-tree rsync of `repo_root` to `target`, honoring `rules`.
+async fn run_rsync(repo_root: &Path, target: &Target, rules: &Rules) -> Result<()> {
+    // Prefer the exact `dsync-ignore` translation; on the rare untranslatable
+    // rule set (a pathological `**` blow-up) fall back to the interim
+    // per-directory dir-merge filters, which are approximately right.
+    let filters = rules
+        .rsync_filter_args()
+        .unwrap_or_else(|| interim_rsync_filter_args(repo_root));
     let mut source = repo_root.as_os_str().to_owned();
     source.push("/");
     let mut cmd = tokio::process::Command::new("rsync");
@@ -222,7 +239,7 @@ async fn run_rsync(repo_root: &Path, target: &Target) -> Result<()> {
         // quick-check *forever* — its size and integer mtime never change
         // again.
         .arg("--modify-window=-1")
-        .args(rsync_filter_args(repo_root))
+        .args(filters)
         .arg(source)
         .arg(target.rsync_dest());
     debug!(?cmd, "running rsync");
@@ -243,8 +260,9 @@ async fn run_rsync(repo_root: &Path, target: &Target) -> Result<()> {
     }
 }
 
-/// Build the rsync filter arguments implementing Phase 1's approximate
-/// ignore handling:
+/// Build the interim rsync filter arguments — Phase 1's approximate ignore
+/// handling, now used only as the fallback when `dsync-ignore` cannot
+/// translate the rules exactly (a pathological `**` blow-up):
 ///
 /// - `.git/` and `.dsync/` are always excluded (and, since we never pass
 ///   `--delete-excluded`, never deleted from the destination);
@@ -252,7 +270,7 @@ async fn run_rsync(repo_root: &Path, target: &Target) -> Result<()> {
 /// - `.git/info/exclude` and `core.excludesFile` apply as lower-precedence
 ///   merge files (rsync filter rules are first-match-wins, so later args
 ///   have lower precedence, matching git's ordering).
-fn rsync_filter_args(repo_root: &Path) -> Vec<OsString> {
+fn interim_rsync_filter_args(repo_root: &Path) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec![
         "--exclude=.git".into(),
         "--exclude=.dsync".into(),
@@ -353,7 +371,7 @@ mod tests {
     #[test]
     fn filter_args_always_exclude_git_and_dsync() {
         let tmp = tempfile::tempdir().unwrap();
-        let args = rsync_filter_args(tmp.path());
+        let args = interim_rsync_filter_args(tmp.path());
         assert!(args.contains(&OsString::from("--exclude=.git")));
         assert!(args.contains(&OsString::from("--exclude=.dsync")));
         assert!(args.contains(&OsString::from("--filter=:- .gitignore")));
@@ -385,7 +403,7 @@ mod tests {
         std::fs::write(&global, "*.bak\n").unwrap();
         git(&["config", "core.excludesFile", global.to_str().unwrap()]);
 
-        let args = rsync_filter_args(&repo);
+        let args = interim_rsync_filter_args(&repo);
         let rendered: Vec<String> = args
             .iter()
             .map(|a| a.to_string_lossy().into_owned())

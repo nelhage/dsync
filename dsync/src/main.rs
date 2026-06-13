@@ -4,6 +4,7 @@ use tracing_subscriber::EnvFilter;
 mod barrier;
 mod client;
 mod exec;
+mod ignore;
 mod protocol;
 mod repo;
 mod server;
@@ -11,6 +12,7 @@ mod state;
 mod status;
 mod sync;
 mod target;
+mod wquery;
 
 use target::Target;
 

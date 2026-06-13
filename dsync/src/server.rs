@@ -18,11 +18,13 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 use watchman_client::prelude::*;
 
+use crate::ignore::{self, RulesHandle};
 use crate::protocol::{
     self, BarrierResponse, ListResponse, PendingStatus, Request, RequestOp, Response, RpcResult,
     StatusResponse, SyncedStatus, SyncingStatus,
 };
 use crate::state::{ReplicaState, ServerState};
+use crate::wquery;
 
 /// The shared watchman connection: the sync loop's subscription and the IPC
 /// server's queries all flow over this single connection, which is what
@@ -140,6 +142,7 @@ pub async fn run(
     listener: UnixListener,
     state: Arc<ServerState>,
     watchman: Arc<Watchman>,
+    rules: RulesHandle,
     seq: SeqAssigner,
 ) -> Result<()> {
     loop {
@@ -149,9 +152,10 @@ pub async fn run(
             .context("accept on the IPC socket failed")?;
         let state = Arc::clone(&state);
         let watchman = Arc::clone(&watchman);
+        let rules = rules.clone();
         let seq = seq.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(stream, state, watchman, seq).await {
+            if let Err(err) = handle_connection(stream, state, watchman, rules, seq).await {
                 debug!("IPC connection ended with error: {err:#}");
             }
         });
@@ -164,6 +168,7 @@ async fn handle_connection(
     stream: UnixStream,
     state: Arc<ServerState>,
     watchman: Arc<Watchman>,
+    rules: RulesHandle,
     seq: SeqAssigner,
 ) -> Result<()> {
     let (read_half, write_half) = stream.into_split();
@@ -174,7 +179,7 @@ async fn handle_connection(
             continue;
         }
         let result = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => handle_request(req, &state, &watchman, &seq).await,
+            Ok(req) => handle_request(req, &state, &watchman, &rules, &seq).await,
             Err(err) => RpcResult::Error(format!("cannot parse request: {err}")),
         };
         if let RpcResult::Error(err) = &result {
@@ -196,6 +201,7 @@ async fn handle_request(
     req: Request,
     state: &ServerState,
     watchman: &Watchman,
+    rules: &RulesHandle,
     seq: &SeqAssigner,
 ) -> RpcResult<Value> {
     if req.version != protocol::VERSION {
@@ -210,9 +216,9 @@ async fn handle_request(
         RequestOp::List => RpcResult::Ok(to_value(ListResponse {
             replicas: state.replica_names(),
         })),
-        RequestOp::Status { replica } => handle_status(&replica, state, watchman).await,
+        RequestOp::Status { replica } => handle_status(&replica, state, watchman, rules).await,
         RequestOp::Barrier { replica, timeout } => {
-            handle_barrier(&replica, timeout, state, watchman, seq).await
+            handle_barrier(&replica, timeout, state, watchman, rules, seq).await
         }
     }
 }
@@ -221,17 +227,18 @@ async fn handle_status(
     replica: &str,
     state: &ServerState,
     watchman: &Watchman,
+    rules: &RulesHandle,
 ) -> RpcResult<Value> {
     let Some(snapshot) = state.replica(replica) else {
         return RpcResult::Error(format!("unknown replica {replica:?}"));
     };
     // Up-to-dateness is *state computed now*, server-side: a cookie-
     // synchronized since-query against the synced clock yields the set of
-    // files not yet covered by a completed sync. The clock itself never
-    // leaves this process. With no completed sync there is no clock to
+    // syncable files not yet covered by a completed sync. The clock itself
+    // never leaves this process. With no completed sync there is no clock to
     // query against; `pending` stays `None`.
     let pending = match &snapshot.synced {
-        Some(synced) => match pending_files(watchman, synced.clock.clone()).await {
+        Some(synced) => match pending_files(watchman, rules, synced.clock.clone()).await {
             Ok(pending) => Some(pending),
             Err(err) => {
                 return RpcResult::Error(format!(
@@ -272,6 +279,7 @@ async fn handle_barrier(
     timeout: Option<f64>,
     state: &ServerState,
     watchman: &Watchman,
+    rules: &RulesHandle,
     seq: &SeqAssigner,
 ) -> RpcResult<Value> {
     if state.replica(replica).is_none() {
@@ -299,7 +307,7 @@ async fn handle_barrier(
     };
     debug!(replica, target_seq, "barrier parked");
 
-    let wait = wait_for_coverage(replica, target_seq, state, watchman);
+    let wait = wait_for_coverage(replica, target_seq, state, watchman, rules);
     let outcome = match timeout {
         Some(t) => match tokio::time::timeout(Duration::from_secs_f64(t), wait).await {
             Ok(outcome) => outcome,
@@ -347,6 +355,7 @@ async fn wait_for_coverage(
     target_seq: u64,
     state: &ServerState,
     watchman: &Watchman,
+    rules: &RulesHandle,
 ) -> Result<(ReplicaState, Option<PendingStatus>)> {
     let mut completions = state.subscribe_synced();
     loop {
@@ -358,7 +367,7 @@ async fn wait_for_coverage(
             if synced.seq >= target_seq {
                 return Ok((snapshot, None));
             }
-            let pending = pending_files(watchman, synced.clock.clone())
+            let pending = pending_files(watchman, rules, synced.clock.clone())
                 .await
                 .context("watchman since-query failed")?;
             if pending.files == 0 {
@@ -372,48 +381,34 @@ async fn wait_for_coverage(
     }
 }
 
-/// Count the files changed since `clock` with a cookie-synchronized
-/// watchman since-query. `is_fresh_instance` means the clock belongs to a
-/// dead watchman instance: the count covers the whole tree and the
-/// subscription is independently delivering the full-resync signal.
-async fn pending_files(watchman: &Watchman, clock: Clock) -> Result<PendingStatus> {
-    let result: QueryResult<NameOnly> = watchman
-        .client
-        .query(
-            &watchman.root,
-            QueryRequestCommon {
-                since: Some(clock),
-                // Cookie synchronization: the result reflects all
-                // filesystem changes that happened before this request.
-                sync_timeout: SyncTimeout::Default,
-                expression: Some(exclude_internal_paths()),
-                ..Default::default()
-            },
-        )
-        .await?;
+/// Count the *syncable* files changed since `clock` with a cookie-
+/// synchronized watchman since-query, filtering out ignored paths through
+/// the live ignore rules (so e.g. churn in a gitignored `target/` is never
+/// "pending"). `is_fresh_instance` means the clock belongs to a dead
+/// watchman instance: the count covers the whole tree and the subscription
+/// is independently delivering the full-resync signal.
+async fn pending_files(
+    watchman: &Watchman,
+    rules: &RulesHandle,
+    clock: Clock,
+) -> Result<PendingStatus> {
+    // Snapshot the expression and drop the borrow before awaiting; if the
+    // rules can't be translated to watchman (a negated pattern), fall back
+    // to excluding only the internal paths so the count is never inflated by
+    // `.git`/`.dsync`.
+    let expr = {
+        let rules = rules.borrow();
+        let ignored = rules
+            .ignored_expr()
+            .cloned()
+            .unwrap_or_else(ignore::builtin_ignored_expr);
+        wquery::not_ignored(&ignored)
+    };
+    let result = wquery::since_query(watchman, &clock, &expr).await?;
     Ok(PendingStatus {
-        files: result.files.map_or(0, |f| f.len()) as u64,
+        files: result.files.len() as u64,
         fresh_instance: result.is_fresh_instance,
     })
-}
-
-/// Match everything except `.git/` and `.dsync/` (and their contents),
-/// which are never synced and so are never "pending".
-fn exclude_internal_paths() -> Expr {
-    Expr::Not(Box::new(Expr::Any(vec![
-        Expr::Name(NameTerm {
-            paths: vec![".git".into(), ".dsync".into()],
-            wholename: true,
-        }),
-        Expr::DirName(DirNameTerm {
-            path: ".git".into(),
-            depth: None,
-        }),
-        Expr::DirName(DirNameTerm {
-            path: ".dsync".into(),
-            depth: None,
-        }),
-    ])))
 }
 
 fn to_value<T: serde::Serialize>(payload: T) -> Value {
