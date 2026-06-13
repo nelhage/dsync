@@ -6,12 +6,13 @@ earlier ones. Design decisions made along the way are recorded at the end.
 
 ## Notes for implementation sessions
 
-Status as of 2026-06-12: Phases 0–5 complete (Phase 5 was built in
-parallel and is merged). The `dsync` crate still uses its interim Phase 1
-ignore handling (rsync `:- .gitignore` dir-merge, `.git`/`.dsync`-only
-watchman exclusion); wiring `dsync-ignore` into the sync loop and the
-status/barrier since-queries lands with Phase 6, which needs the watchman
-translation anyway.
+Status as of 2026-06-13: Phases 0–6 complete. Phase 6 wired `dsync-ignore`
+into the sync loop (the integration deferred from Phase 5): the full-tree
+rsync filters and the status/barrier since-queries now go through the rule
+engine, and the small-change fast path streams just the changed files. The
+interim Phase 1 dir-merge filters survive only as the fallback for the rare
+rule set `dsync-ignore` cannot translate to rsync. Remaining phases: 7
+(daemonization) and 8 (multi-replica).
 
 - [dsync.md](dsync.md) is the authoritative behavior spec; this file covers
   sequencing and recorded decisions. The Decisions section at the bottom was
@@ -317,6 +318,27 @@ both are ready.
   Document (and test) any known, accepted divergences.
 
 ## Phase 6 — Small-change fast path
+
+**Status: done (2026-06-13).** The Phase 5 ignore engine is now wired into
+the sync loop (the deferred integration): full-tree rsync filters and the
+status/barrier since-queries both go through `dsync-ignore` (`ignore.rs`),
+and a raw watchman since-query helper (`wquery.rs`) carries the
+property-tested JSON expressions through `watchman_client::generic_request`
+(the typed query API has no raw-expression escape hatch). The fast path
+itself lives in `fastpath.rs`: a since-query against the last synced clock
+yields the changed, non-ignored paths (deletions included); under the file
+(64) and byte (8 MiB) thresholds they stream as a tar (zstd-compressed when
+both ends have zstd, probed once at startup) plus a `rm -rf` deletion list to
+a shell unpacker — over ssh for remote targets, locally for local-path ones.
+The correctness valve in `sync_once` falls back to a full rsync on any
+uncertainty (fresh instance, untranslatable rules, oversized payload, a file
+that vanished mid-flight, an unpacker failure), and a periodic full rsync
+(`HEAL_INTERVAL`, default 5 min; `DSYNC_HEAL_INTERVAL_MS` for tests)
+self-heals drift. The recorded synced clock is unchanged (the triggering
+event's), so the Phase 2/3 clock-ordering and barrier semantics are
+untouched. Notes for later phases: the fast path does not preserve empty
+directories (the periodic full rsync reconciles them); `core.excludesFile`
+changes mid-session are not picked up (it lives outside the watch).
 
 - On a watchman notification below a threshold (N files, M bytes), skip rsync:
   - Build the changed-file list from watchman, filtered through the Phase 5
