@@ -12,6 +12,7 @@ use tracing::{debug, error, info, warn};
 use watchman_client::SubscriptionData;
 use watchman_client::prelude::*;
 
+use crate::fastpath::{self, Compression};
 use crate::ignore::Rules;
 use crate::protocol::DEFAULT_REPLICA;
 use crate::server::{self, Watchman};
@@ -32,6 +33,9 @@ struct ChangeEvent {
     seq: u64,
     clock: Clock,
     files: Option<usize>,
+    /// watchman reported a fresh instance with this notification: the whole
+    /// tree must be resynced, so the fast path is not eligible.
+    fresh_instance: bool,
 }
 
 /// Run `ds sync`: subscribe to watchman and rsync the repository to
@@ -111,6 +115,7 @@ pub async fn run(repo_root: PathBuf, target: Target) -> Result<()> {
                             seq,
                             clock: result.clock,
                             files: result.files.as_ref().map(|f| f.len()),
+                            fresh_instance: result.is_fresh_instance,
                         };
                         debug!(seq, files = ?event.files, "change notification");
                         tracing::trace!(
@@ -138,6 +143,11 @@ pub async fn run(repo_root: PathBuf, target: Target) -> Result<()> {
             }
         }
     };
+
+    // The fast path queries and streams over the same watchman connection
+    // and target; probe for zstd on both ends once, here at startup.
+    let runner_watchman = Arc::clone(&watchman);
+    let compression = fastpath::detect_compression(&target).await;
 
     let runner = async move {
         let mut retrying = false;
@@ -170,13 +180,29 @@ pub async fn run(repo_root: PathBuf, target: Target) -> Result<()> {
                     started_at: SystemTime::now(),
                 });
             });
+            // The clock of the last completed sync is the lower bound for a
+            // fast-path since-query. With none yet (the startup sync), the
+            // fast path is ineligible and we full-rsync.
+            let prev_clock = state
+                .replica(DEFAULT_REPLICA)
+                .and_then(|r| r.synced.map(|s| s.clock));
             let started = Instant::now();
-            match run_rsync(&repo_root, &target, &rules).await {
-                Ok(()) => {
+            match sync_once(
+                &repo_root,
+                &target,
+                &runner_watchman,
+                &rules,
+                prev_clock.as_ref(),
+                &event,
+                compression,
+            )
+            .await
+            {
+                Ok(mode) => {
                     retrying = false;
                     info!(
                         seq = event.seq,
-                        "sync finished in {:.2?}",
+                        "{mode} sync finished in {:.2?}",
                         started.elapsed()
                     );
                     debug!(
@@ -213,6 +239,50 @@ pub async fn run(repo_root: PathBuf, target: Target) -> Result<()> {
         result = runner => result,
         result = server => result,
     }
+}
+
+/// Run one sync of the latest `event`, taking the small-change fast path
+/// when it is eligible and falling back to a full rsync otherwise (or when
+/// the fast path declines or errors). Returns a label for logging.
+async fn sync_once(
+    repo_root: &Path,
+    target: &Target,
+    watchman: &Watchman,
+    rules: &Rules,
+    prev_clock: Option<&Clock>,
+    event: &ChangeEvent,
+    compression: Compression,
+) -> Result<&'static str> {
+    // The fast path is eligible only when the work can be bounded precisely:
+    // a prior completed sync to query since, no fresh instance, a rule set
+    // watchman can express, and a notification small enough to be worth it.
+    if let Some(since) = prev_clock
+        && !event.fresh_instance
+        && let Some(ignored) = rules.ignored_expr()
+        && event.files.is_none_or(|n| n <= fastpath::MAX_FILES)
+    {
+        match fastpath::try_fast_path(repo_root, target, watchman, ignored, since, compression)
+            .await
+        {
+            Ok(fastpath::Outcome::Applied) => return Ok("fast"),
+            // The correctness valve: any uncertainty falls back to a full
+            // rsync, which is always correct on its own.
+            Ok(fastpath::Outcome::Fallback(reason)) => {
+                debug!(
+                    seq = event.seq,
+                    "fast path declined ({reason}); running full rsync"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    seq = event.seq,
+                    "fast path failed ({err:#}); running full rsync"
+                );
+            }
+        }
+    }
+    run_rsync(repo_root, target, rules).await?;
+    Ok("full")
 }
 
 /// Run one full-tree rsync of `repo_root` to `target`, honoring `rules`.

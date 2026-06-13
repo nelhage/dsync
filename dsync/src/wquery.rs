@@ -24,10 +24,7 @@ use crate::server::Watchman;
 /// ("as-of now") regardless of the server's configured default.
 const SYNC_TIMEOUT_MS: i64 = 60_000;
 
-/// One changed path returned by a since-query. The `exists`/`file_type`
-/// fields are read by the fast path; the pending-count caller uses only the
-/// list length, so they appear unused until the fast path lands.
-#[allow(dead_code)]
+/// One changed path returned by a since-query.
 #[derive(Debug, Clone)]
 pub struct ChangedFile {
     /// Path relative to the watched root.

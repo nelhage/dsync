@@ -107,7 +107,7 @@ fn remote_command(path: &str, argv: &[String]) -> String {
 
 /// Quote one word for POSIX sh: pass obviously-safe words through, wrap
 /// everything else in single quotes (with embedded `'` as `'\''`).
-fn sh_quote(s: &str) -> String {
+pub(crate) fn sh_quote(s: &str) -> String {
     let safe = |b: u8| b.is_ascii_alphanumeric() || b"@%+=:,./_-".contains(&b);
     if !s.is_empty() && s.bytes().all(safe) {
         return s.to_string();

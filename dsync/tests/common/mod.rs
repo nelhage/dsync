@@ -224,6 +224,13 @@ impl Harness {
     pub fn stderr(&self) -> String {
         std::fs::read_to_string(&self.stderr_path).unwrap_or_default()
     }
+
+    /// How many times `needle` appears in the child's stderr so far. Used to
+    /// distinguish fast-path from full syncs via their "<mode> sync finished"
+    /// log lines.
+    pub fn count_stderr(&self, needle: &str) -> usize {
+        self.stderr().matches(needle).count()
+    }
 }
 
 impl Drop for Harness {

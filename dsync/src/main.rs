@@ -4,6 +4,7 @@ use tracing_subscriber::EnvFilter;
 mod barrier;
 mod client;
 mod exec;
+mod fastpath;
 mod ignore;
 mod protocol;
 mod repo;
