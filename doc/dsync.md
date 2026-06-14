@@ -19,7 +19,7 @@ The `HOST:` component is optional; `dsync` supports synchronizing to an another 
 
 While a `ds sync` process is running, it listens on a UNIX domain socket under `.dsync/dsync.sock`. Other commands can talk to the socket. Those include:
 
-### `ds status` (`ds stat` or `ds s` for short)
+### `ds status` (`ds stat` or `ds st` for short)
 
 Shows the status of all running `dsync sync` processes. PID, whether or not they are up-to-date, whether or not they are currently syncing.
 

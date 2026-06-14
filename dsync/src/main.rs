@@ -35,7 +35,7 @@ enum Command {
         target: String,
     },
     /// Show the status of the running sync process.
-    #[command(visible_aliases = ["stat", "s"])]
+    #[command(visible_aliases = ["stat", "st"])]
     Status,
     /// Block until the replica is up-to-date as-of this invocation.
     #[command(visible_alias = "b")]
