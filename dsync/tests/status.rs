@@ -48,7 +48,7 @@ fn status_reports_up_to_date_then_tracks_changes() {
 fn status_aliases_work_against_a_live_server() {
     let mut h = Harness::new();
     h.wait_for_socket();
-    for alias in ["stat", "s"] {
+    for alias in ["stat", "st"] {
         let out = h.ds(&[alias]);
         assert!(
             out.status.success(),
