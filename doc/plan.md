@@ -72,9 +72,18 @@ local-path targets. Notes for later phases:
   `tokio::sync::watch` latest-value channel between the watchman reader task
   and the sync runner. Failed syncs retry every 2s against the latest
   pending event.
-- The subscription is unfiltered, so `.git/` (and gitignored-path) churn
-  triggers no-op rsyncs; harmless but noisy. Once Phase 5 lands, the
-  watchman-query translation can filter the subscription expression.
+- The subscription carries a coarse filter (`sync::subscription_expr`) that
+  drops `.git`/`.dsync` churn — the always-excluded internal paths — so
+  constant git activity no longer wakes the sync loop for no-op syncs. It
+  mirrors `ignore::builtin_ignored_expr` in the typed `Expr` form
+  `SubscribeRequest` requires (the query side uses raw JSON; see `wquery`).
+  The filter is only a wakeup optimization and is deliberately *static*
+  (`.git`/`.dsync` only, not the dynamic ignore rules, which the fixed
+  subscription expression couldn't track across rule edits): the
+  authoritative filtering stays in the fast-path since-query and in
+  `pending_files`. Other gitignored-path churn can still trigger a wakeup
+  that finds nothing to sync; that case returns `Outcome::NoChanges` and is
+  silent at INFO (logged only at `trace`).
 - `sync.rs` keeps the in-memory `SyncedClock { seq, clock, completed_at }`
   record (receipt-order seq per the clock-handling design); Phase 2 moves
   this into state shared with the IPC server.

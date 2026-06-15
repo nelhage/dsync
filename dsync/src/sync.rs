@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use tokio::sync::watch;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use watchman_client::SubscriptionData;
 use watchman_client::prelude::*;
 
@@ -54,6 +54,39 @@ struct ChangeEvent {
     fresh_instance: bool,
 }
 
+/// A coarse subscription filter that drops notifications for the
+/// always-excluded internal paths (`.git`/`.dsync` and their contents).
+///
+/// `.git/` churns constantly (index locks, refs, logs) yet is *never*
+/// synced, so without this filter every git operation wakes the sync loop
+/// only for the fast path to find nothing to do. These two paths are
+/// excluded unconditionally (the invariant), independent of the dynamic
+/// ignore rules, so filtering them at the subscription is always safe.
+///
+/// This is only a pre-filter to cut spurious wakeups; the authoritative,
+/// property-tested filtering still happens in the fast path's since-query
+/// (`wquery::not_ignored` over the live rules). It mirrors
+/// `ignore::builtin_ignored_expr` in the typed `Expr` form that
+/// `SubscribeRequest` requires (the query side uses raw JSON; see `wquery`).
+fn subscription_expr() -> Expr {
+    let dir_or_self = |name: &str| {
+        Expr::Any(vec![
+            Expr::DirName(DirNameTerm {
+                path: PathBuf::from(name),
+                depth: None,
+            }),
+            Expr::Name(NameTerm {
+                paths: vec![PathBuf::from(name)],
+                wholename: true,
+            }),
+        ])
+    };
+    Expr::Not(Box::new(Expr::Any(vec![
+        dir_or_self(".git"),
+        dir_or_self(".dsync"),
+    ])))
+}
+
 /// Run `ds sync`: subscribe to watchman and rsync the repository to
 /// `target` on every (settled) change, forever, while serving IPC requests
 /// on `.dsync/dsync.sock`.
@@ -74,7 +107,13 @@ pub async fn run(repo_root: PathBuf, target: Target) -> Result<()> {
     // The default subscription immediately delivers a fresh-instance
     // notification covering the whole tree, which drives the startup sync.
     let (mut subscription, _response) = client
-        .subscribe::<NameOnly>(&resolved, SubscribeRequest::default())
+        .subscribe::<NameOnly>(
+            &resolved,
+            SubscribeRequest {
+                expression: Some(subscription_expr()),
+                ..SubscribeRequest::default()
+            },
+        )
         .await
         .context("watchman subscribe failed")?;
     info!("watching {} -> {}", repo_root.display(), target);
@@ -220,10 +259,6 @@ pub async fn run(repo_root: PathBuf, target: Target) -> Result<()> {
             // server (whose since-queries filter against them).
             let rules = Arc::new(Rules::load(&repo_root));
             let _ = rules_tx.send(Arc::clone(&rules));
-            match event.files {
-                Some(n) => info!(seq = event.seq, "sync started ({n} files changed)"),
-                None => info!(seq = event.seq, "sync started"),
-            }
             state.with_replica(DEFAULT_REPLICA, |r| {
                 r.syncing = Some(SyncingClock {
                     seq: event.seq,
@@ -238,14 +273,26 @@ pub async fn run(repo_root: PathBuf, target: Target) -> Result<()> {
                 .and_then(|r| r.synced.map(|s| s.clock));
             let started = Instant::now();
             match sync_once(&ctx, &rules, prev_clock.as_ref(), &event, force_full).await {
-                Ok(mode) => {
+                Ok(outcome) => {
                     retrying = false;
                     force_full = false;
-                    info!(
-                        seq = event.seq,
-                        "{mode} sync finished in {:.2?}",
-                        started.elapsed()
-                    );
+                    match outcome {
+                        SyncOutcome::Synced(mode) => info!(
+                            seq = event.seq,
+                            "{mode} sync finished in {:.2?}",
+                            started.elapsed()
+                        ),
+                        // Only ignored files changed since the last sync, so
+                        // nothing was propagated. This can fire on every
+                        // touched build artifact, so stay quiet at INFO — but
+                        // still advance the synced clock below so barriers
+                        // waiting on this event are released.
+                        SyncOutcome::NoChanges => trace!(
+                            seq = event.seq,
+                            "no syncable changes ({:.2?})",
+                            started.elapsed()
+                        ),
+                    }
                     debug!(
                         seq = event.seq,
                         clock = ?event.clock,
@@ -282,9 +329,20 @@ pub async fn run(repo_root: PathBuf, target: Target) -> Result<()> {
     }
 }
 
+/// The result of one sync attempt, for logging by the caller.
+enum SyncOutcome {
+    /// Real work was propagated; the label is the sync mode (`"fast"` /
+    /// `"full"`).
+    Synced(&'static str),
+    /// The fast path found nothing syncable (only ignored files changed since
+    /// the last sync). The synced clock still advances, but there is nothing
+    /// to report.
+    NoChanges,
+}
+
 /// Run one sync of the latest `event`, taking the small-change fast path
 /// when it is eligible and falling back to a full rsync otherwise (or when
-/// the fast path declines or errors). Returns a label for logging.
+/// the fast path declines or errors). Returns the outcome for logging.
 /// The loop-invariant context for a sync: where we sync from and to, over
 /// which watchman connection, and how the fast path compresses.
 struct SyncCtx<'a> {
@@ -300,7 +358,7 @@ async fn sync_once(
     prev_clock: Option<&Clock>,
     event: &ChangeEvent,
     force_full: bool,
-) -> Result<&'static str> {
+) -> Result<SyncOutcome> {
     // The fast path is eligible only when the work can be bounded precisely:
     // not a forced self-heal, a prior completed sync to query since, no fresh
     // instance, a rule set watchman can express, and a notification small
@@ -321,7 +379,8 @@ async fn sync_once(
         )
         .await
         {
-            Ok(fastpath::Outcome::Applied) => return Ok("fast"),
+            Ok(fastpath::Outcome::Applied) => return Ok(SyncOutcome::Synced("fast")),
+            Ok(fastpath::Outcome::NoChanges) => return Ok(SyncOutcome::NoChanges),
             // The correctness valve: any uncertainty falls back to a full
             // rsync, which is always correct on its own.
             Ok(fastpath::Outcome::Fallback(reason)) => {
@@ -338,8 +397,15 @@ async fn sync_once(
             }
         }
     }
+    // "sync started" is logged only here, for the full rsync: it is the slow
+    // path where the up-front notice is worth it. A fast-path sync is near
+    // instantaneous, so its single "fast sync finished" line suffices.
+    match event.files {
+        Some(n) => info!(seq = event.seq, "full sync started ({n} files changed)"),
+        None => info!(seq = event.seq, "full sync started"),
+    }
     run_rsync(ctx.repo_root, ctx.target, rules).await?;
-    Ok("full")
+    Ok(SyncOutcome::Synced("full"))
 }
 
 /// Run one full-tree rsync of `repo_root` to `target`, honoring `rules`.

@@ -47,6 +47,10 @@ pub enum Compression {
 pub enum Outcome {
     /// The changes were applied to the target; the sync is complete.
     Applied,
+    /// The since-query found nothing syncable — only ignored files (or
+    /// nothing) changed since the last sync, so there was no work to do. The
+    /// sync is complete, but nothing was propagated.
+    NoChanges,
     /// The fast path declined (with a human-readable reason); the caller
     /// must run a full rsync instead. This is the correctness valve, not an
     /// error: the reason is expected (a fresh instance, an oversized change,
@@ -136,9 +140,9 @@ pub async fn try_fast_path(
     }
 
     if sends.is_empty() && deletes.is_empty() {
-        // Only ignored files (or nothing) changed since the last sync.
-        debug!("fast path: no syncable changes");
-        return Ok(Outcome::Applied);
+        // Only ignored files (or nothing) changed since the last sync. The
+        // caller decides how (un)loudly to report this; see `sync_once`.
+        return Ok(Outcome::NoChanges);
     }
     if sends.len() > MAX_FILES {
         return Ok(Outcome::Fallback(format!(
