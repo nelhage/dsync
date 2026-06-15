@@ -121,6 +121,14 @@ pub async fn run(repo_root: PathBuf, target: Target) -> Result<()> {
                         // Receipt order is clock order: tag each clock with
                         // the next sequence number as it arrives.
                         let seq = reader_state.next_seq();
+                        // Dump the raw watchman event at the highest verbosity
+                        // (`-vvv`); see `init_tracing` for the gating.
+                        tracing::trace!(
+                            target: "watchman_events",
+                            seq,
+                            event = ?result,
+                            "watchman event"
+                        );
                         if result.is_fresh_instance {
                             info!(
                                 seq,

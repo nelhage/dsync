@@ -22,6 +22,12 @@ use target::Target;
 #[derive(Debug, Parser)]
 #[command(name = "ds", version, about)]
 struct Cli {
+    /// Increase logging verbosity; repeat for more. `-v` enables debug
+    /// logging, `-vv` enables trace logging, and `-vvv` additionally dumps
+    /// the full events received from watchman. Overrides `RUST_LOG`.
+    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
+    verbose: u8,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -69,19 +75,27 @@ async fn cmd_sync(target: &str) -> anyhow::Result<()> {
     sync::run(repo_root, target).await
 }
 
-fn init_tracing() {
+fn init_tracing(verbose: u8) {
+    // The full watchman-event dump (target `watchman_events`) is logged at
+    // trace level but kept off until `-vvv`: at `-vv` a bare `trace` filter
+    // would otherwise pull it in, so it is explicitly silenced there and
+    // re-enabled only at the highest verbosity.
+    let filter = match verbose {
+        0 => EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        1 => EnvFilter::new("debug"),
+        2 => EnvFilter::new("trace,watchman_events=off"),
+        _ => EnvFilter::new("trace"),
+    };
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+        .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_tracing();
     let cli = Cli::parse();
+    init_tracing(cli.verbose);
     match &cli.command {
         Command::Sync { target } => cmd_sync(target).await,
         Command::Status => status::cmd_status().await,
