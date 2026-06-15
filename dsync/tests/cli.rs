@@ -55,7 +55,7 @@ fn sync_outside_a_repo_fails_fast() {
 #[test]
 fn status_outside_a_repo_fails_fast() {
     let tmp = tempfile::tempdir().unwrap();
-    for args in [["status"], ["stat"], ["s"]] {
+    for args in [["status"], ["stat"], ["st"]] {
         let out = Command::new(env!("CARGO_BIN_EXE_ds"))
             .args(args)
             .current_dir(tmp.path())
