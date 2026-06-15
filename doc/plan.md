@@ -413,3 +413,22 @@ Resolved with the design owner (2026-06-12):
    RPC rather than expose watchman clocks.
 8. **Plain log-line output first**; TUI later if wanted.
 9. **No persisted config in v1.** Target is given on the CLI.
+
+Later decisions:
+
+10. **`dsync-ignore` emits watchman expressions as `serde_json::Value`, not
+    `watchman_client::Expr`** (2026-06-15). Considered switching so the
+    subscription and since-query could share one typed expression and
+    `wquery`'s hand-built PDU could be deleted. Rejected: `Expr` is a
+    BSER-oriented type that does not round-trip to JSON — its path fields
+    serialize via `serde_bser::ByteString` → `serialize_bytes`, which JSON
+    renders as a byte array (`.git` → `[46,103,105,116]`), so `dirname`/`name`
+    terms are only correct on the BSER wire. `serde_json::Value` is the more
+    versatile representation: correct on the wire (string → BSER string) *and*
+    printable for logs/errors and the property tests (which drive `watchman
+    -j` with JSON). `wquery::since_query` building the query PDU by hand around
+    that JSON is therefore the pragmatic design, not a hack. Corollary: if a
+    typed subscription is ever wanted, convert JSON → `Expr` at that one
+    boundary in `dsync` (structural, round-trips), rather than making
+    `dsync-ignore` emit `Expr`. The static `.git`/`.dsync` subscription filter
+    (`sync::subscription_expr`) stays hand-built as a small typed `Expr`.
